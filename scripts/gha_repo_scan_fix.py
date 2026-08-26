@@ -994,6 +994,7 @@ def apply_stub_insertions_to_clone(
 # full GHA file_list (lockfiles, markdown, images) is a no-op per file but
 # wastes runner time; restrict to these.
 _LOCAL_STUB_SCANNABLE_EXTS = frozenset({".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go"})
+_LOCAL_STUB_SKIP_BASENAMES = frozenset({"gr_stub_client.py"})
 _LOCAL_STUB_MAX_FILES = 200
 
 
@@ -1045,6 +1046,7 @@ def _scannable_files_for_local_stubs(
             rel
             and rel in listed
             and pathlib.Path(rel).suffix.lower() in _LOCAL_STUB_SCANNABLE_EXTS
+            and pathlib.Path(rel).name.lower() not in _LOCAL_STUB_SKIP_BASENAMES
             and rel not in seen
         ):
             seen.add(rel)
@@ -1055,6 +1057,7 @@ def _scannable_files_for_local_stubs(
         f.replace("\\", "/")
         for f in file_list
         if pathlib.Path(f).suffix.lower() in _LOCAL_STUB_SCANNABLE_EXTS
+        and pathlib.Path(f).name.lower() not in _LOCAL_STUB_SKIP_BASENAMES
     ]
 
 
@@ -1245,6 +1248,30 @@ def parallel_batch_scan(
 # JSON output
 # ===========================================================================
 
+# Human report must not include stub-insertion write-ups (PR body or report.json).
+_STUB_REPORT_HEADINGS = (
+    "## UniFAI Guardrail Stub Insertion",
+    "## Guardrail Stub Insertions",
+    "## SECTION 2: Guardrail Stub Coverage",
+)
+
+
+def _strip_stub_insertion_markdown(report: str) -> str:
+    """Drop stub-insertion sections from the policy report markdown."""
+    if not report:
+        return ""
+    parts = re.split(r"(?=^## )", report, flags=re.MULTILINE)
+    kept: List[str] = []
+    for part in parts:
+        if any(part.startswith(h) for h in _STUB_REPORT_HEADINGS):
+            continue
+        kept.append(part)
+    text = "".join(kept)
+    text = re.sub(r"\n---\s*(?=\n*$)", "\n", text)
+    text = re.sub(r"\n---\s*\n+(?=\n## |\n### |\Z)", "\n\n", text)
+    return text.strip() + ("\n" if text.strip() else "")
+
+
 def build_json_output(
     *,
     status: str,
@@ -1276,7 +1303,7 @@ def build_json_output(
             "batches": batches,
             "failed_batches": failed_batches,
         },
-        "report": report,
+        "report": _strip_stub_insertion_markdown(report),
         "violations": violations,
         "aibom": aibom or [],
         "enforce_service_url": enforce_service_url,
@@ -1430,6 +1457,7 @@ def _build_fix_pr_body(
     """PR description: UnifAI report first, full scan report folded. Stub files are
     on the branch itself — they are not listed in this body."""
     violations = violations or []
+    report = _strip_stub_insertion_markdown(report)
     if "## No Files Changed" in (report or ""):
         report = ""
     report_says_violations = "violations_found" in (report or "")
