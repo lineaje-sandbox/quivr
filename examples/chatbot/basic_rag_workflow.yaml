@@ -15,8 +15,8 @@ workflow_config:
 
     - name: "generate_rag" # the name of the last node, from which we want to stream the answer to the user
       edges: ["END"]
-      tools:
-        - name: "cited_answer"
+      # cited_answer needs integer citation IDs from function calling.
+      # Local Ollama models often emit "[1]" as ["[", 1, "]"] and crash metadata parsing.
 
 # Maximum number of previous conversation iterations
 # to include in the context of the answer
@@ -33,11 +33,11 @@ max_history: 10
 #   # Number of chunks returned by the reranker
 #   top_n: 5
 
-# Configuration for the LLM
+# Configuration for the LLM (Ollama OpenAI-compatible API).
+# max_output_tokens must be >= 4096 or RetrievalConfig validation fails.
 llm_config:
-
-  # maximum number of tokens passed to the LLM to generate the answer
-  max_output_tokens: 4000
-
-  # temperature for the LLM
+  model: llama3
+  llm_base_url: http://localhost:11434/v1
+  llm_api_key: ollama
+  max_output_tokens: 8192
   temperature: 0.7

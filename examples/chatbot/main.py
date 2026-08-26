@@ -1,8 +1,44 @@
+import os
 import tempfile
+from uuid import uuid4
 
 import chainlit as cl
-from quivr_core import Brain
-from quivr_core.rag.entities.config import RetrievalConfig
+from langchain_community.embeddings import OllamaEmbeddings
+from quivr_core import Brain, register_processor
+from quivr_core.files.file import FileExtension
+from quivr_core.llm import LLMEndpoint
+from quivr_core.processor.implementations.simple_txt_processor import SimpleTxtProcessor
+from quivr_core.rag.entities.config import LLMEndpointConfig, RetrievalConfig
+
+# Parse .txt locally. Megaparse is the default and tries Quivr's hosted NATS,
+# which fails with "nodename nor servname provided" when that host is down.
+register_processor(FileExtension.txt, SimpleTxtProcessor, override=True)
+
+# ChatOpenAI requires a key even when the backend is Ollama's OpenAI-compatible API.
+os.environ.setdefault("OPENAI_API_KEY", "ollama")
+
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+
+
+def ollama_llm() -> LLMEndpoint:
+    llm = LLMEndpoint.from_config(
+        LLMEndpointConfig(
+            model=OLLAMA_CHAT_MODEL,
+            llm_api_key="ollama",
+            llm_base_url=f"{OLLAMA_HOST.rstrip('/')}/v1",
+            max_output_tokens=8192,
+            temperature=0.7,
+        )
+    )
+    # Local models usually cannot satisfy cited_answer tool calls.
+    llm._supports_func_calling = False
+    return llm
+
+
+def ollama_embedder() -> OllamaEmbeddings:
+    return OllamaEmbeddings(model=OLLAMA_EMBED_MODEL, base_url=OLLAMA_HOST)
 
 
 @cl.on_chat_start
@@ -33,7 +69,12 @@ async def on_chat_start():
         temp_file.flush()
         temp_file_path = temp_file.name
 
-    brain = Brain.from_files(name="user_brain", file_paths=[temp_file_path])
+    brain = await Brain.afrom_files(
+        name="user_brain",
+        file_paths=[temp_file_path],
+        llm=ollama_llm(),
+        embedder=ollama_embedder(),
+    )
 
     # Store the file path in the session
     cl.user_session.set("file_path", temp_file_path)
@@ -50,6 +91,9 @@ async def main(message: cl.Message):
     brain = cl.user_session.get("brain")  # type: Brain
     path_config = "basic_rag_workflow.yaml"
     retrieval_config = RetrievalConfig.from_yaml(path_config)
+    if brain is not None:
+        # Keep the YAML workflow, but do not let it fall back to OpenAI.
+        retrieval_config.llm_config = brain.llm.get_config()
 
     if brain is None:
         await cl.Message(content="Please upload a file first.").send()
@@ -64,7 +108,11 @@ async def main(message: cl.Message):
     elements = []
 
     # Use the ask_stream method for streaming responses
-    async for chunk in brain.ask_streaming(message.content, retrieval_config=retrieval_config):
+    async for chunk in brain.ask_streaming(
+        message.content,
+        run_id=uuid4(),
+        retrieval_config=retrieval_config,
+    ):
         await msg.stream_token(chunk.answer)
         for source in chunk.metadata.sources:
             if source.page_content not in saved_sources:
