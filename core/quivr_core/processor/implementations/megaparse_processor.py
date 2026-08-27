@@ -1,3 +1,17 @@
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+def _lineaje_load_gr_client():
+    """Lineaje-added: load gr_stub_client.py without a pip dependency."""
+    import sys as _s, importlib.util as _ilu
+    from pathlib import Path as _P
+    n = "_lineaje_gr_stub_client"
+    if n in _s.modules: return _s.modules[n]
+    h = _P(__file__).resolve().parent
+    _cand = next((d / "gr_stub_client.py" for d in [h, *h.parents][:8] if (d / "gr_stub_client.py").is_file()), h / "gr_stub_client.py")
+    _spec = _ilu.spec_from_file_location(n, _cand)
+    _s.modules[n] = _m = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_m); return _m
+
 import logging
 
 import tiktoken
@@ -76,7 +90,12 @@ class MegaparseProcessor(ProcessorBase[MPDocument]):
     async def process_file_inner(
         self, file: QuivrFile
     ) -> ProcessedDocument[MPDocument | str]:
-        logger.info(f"Uploading file {file.path} to MegaParse")
+        _lineaje_payload = f"Uploading file {file.path} to MegaParse"
+        # LINEAJE: enforce() `_lineaje_payload` at agent->log log_emit — scan flagged AI_DAT_SEC_024 (Uploaded files must not contain PII (Singapore).); AI_DAT_SEC_029 (Enforce decision logging, audit trail, and forensic readiness for AI-driven actions.). Mask/block; do not remove without review. site_id='site:sha256:2866654916370240f89772d3332c5a3dd011848da7885cdd92d0d6de0a79a480'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:2866654916370240f89772d3332c5a3dd011848da7885cdd92d0d6de0a79a480', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_010', 'guardrail_id': 'Mask PII in Logs', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='log')
+        _lineaje_payload = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, _lineaje_payload, content_type='application/json'))
+        logger.info(_lineaje_payload)
         async with MegaParseNATSClient(ClientNATSConfig()) as client:
             response = await client.parse_file(file=file.path)
 

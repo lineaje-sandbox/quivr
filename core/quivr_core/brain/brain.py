@@ -1,3 +1,17 @@
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+def _lineaje_load_gr_client():
+    """Lineaje-added: load gr_stub_client.py without a pip dependency."""
+    import sys as _s, importlib.util as _ilu
+    from pathlib import Path as _P
+    n = "_lineaje_gr_stub_client"
+    if n in _s.modules: return _s.modules[n]
+    h = _P(__file__).resolve().parent
+    _cand = next((d / "gr_stub_client.py" for d in [h, *h.parents][:8] if (d / "gr_stub_client.py").is_file()), h / "gr_stub_client.py")
+    _spec = _ilu.spec_from_file_location(n, _cand)
+    _s.modules[n] = _m = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_m); return _m
+
 import asyncio
 import logging
 import os
@@ -345,7 +359,12 @@ class Brain:
             file = await load_qfile(brain_id, path)
             await storage.upload_file(file)
 
-        logger.debug(f"uploaded all files to {storage}")
+        _lineaje_payload = f"uploaded all files to {storage}"
+        # LINEAJE: enforce() `_lineaje_payload` at agent->log log_emit — scan flagged AI_DAT_SEC_024 (Uploaded files must not contain PII (Singapore).). Mask/block; do not remove without review. site_id='site:sha256:9e8c4ba7bfa74eb2a9279c72bd250bc8f92b86675b4f77898639b31fd41553b6'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:9e8c4ba7bfa74eb2a9279c72bd250bc8f92b86675b4f77898639b31fd41553b6', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_010', 'guardrail_id': 'Mask PII in Logs', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='log')
+        _lineaje_payload = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, _lineaje_payload, content_type='application/json'))
+        logger.debug(_lineaje_payload)
 
         # Parse files
         docs = await process_files(
@@ -360,7 +379,12 @@ class Brain:
         else:
             await vector_db.aadd_documents(docs)
 
-        logger.debug(f"added {len(docs)} chunks to vectordb")
+        _lineaje_payload = f"added {len(docs)} chunks to vectordb"
+        # LINEAJE: enforce() `_lineaje_payload` at agent->log log_emit — scan flagged AI_DAT_SEC_023 (Redact PII from uploaded files.). Mask/block; do not remove without review. site_id='site:sha256:9ec5307255e0f9ad9284be09a004d251b1bd9de36a21d89589b2dbdee4b82a66'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:9ec5307255e0f9ad9284be09a004d251b1bd9de36a21d89589b2dbdee4b82a66', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_010', 'guardrail_id': 'Mask PII in Logs', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='log')
+        _lineaje_payload = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, _lineaje_payload, content_type='application/json'))
+        logger.debug(_lineaje_payload)
 
         return cls(
             id=brain_id,

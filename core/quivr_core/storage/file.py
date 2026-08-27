@@ -1,3 +1,17 @@
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+def _lineaje_load_gr_client():
+    """Lineaje-added: load gr_stub_client.py without a pip dependency."""
+    import sys as _s, importlib.util as _ilu
+    from pathlib import Path as _P
+    n = "_lineaje_gr_stub_client"
+    if n in _s.modules: return _s.modules[n]
+    h = _P(__file__).resolve().parent
+    _cand = next((d / "gr_stub_client.py" for d in [h, *h.parents][:8] if (d / "gr_stub_client.py").is_file()), h / "gr_stub_client.py")
+    _spec = _ilu.spec_from_file_location(n, _cand)
+    _s.modules[n] = _m = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_m); return _m
+
 import hashlib
 import mimetypes
 import os
@@ -95,6 +109,10 @@ class QuivrFile:
     async def open(self) -> AsyncGenerator[AsyncIterable[bytes], None]:
         # TODO(@aminediro) : match on path type
         f = await aiofiles.open(self.path, mode="rb")
+        # LINEAJE: enforce() `f` at file_storage->agent data_egress — scan flagged AI_DAT_SEC_023 (Redact PII from uploaded files.). Mask/block; do not remove without review. site_id='site:sha256:a0981e69d2f31936333289aa3433ba710153de1b8ebb4c61943617f7775da1bb'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:a0981e69d2f31936333289aa3433ba710153de1b8ebb4c61943617f7775da1bb', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'external_endpoint'}, candidate_policies=[], fail_mode='ALLOW_WITH_AUDIT', source_type='file_storage', destination_type='agent')
+        f = _gr_client.enforce(_gr_site, f, content_type='application/json')
         try:
             yield f
         finally:
