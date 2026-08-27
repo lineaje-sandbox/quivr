@@ -1,3 +1,17 @@
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+def _lineaje_load_gr_client():
+    """Lineaje-added: load gr_stub_client.py without a pip dependency."""
+    import sys as _s, importlib.util as _ilu
+    from pathlib import Path as _P
+    n = "_lineaje_gr_stub_client"
+    if n in _s.modules: return _s.modules[n]
+    h = _P(__file__).resolve().parent
+    _cand = next((d / "gr_stub_client.py" for d in [h, *h.parents][:8] if (d / "gr_stub_client.py").is_file()), h / "gr_stub_client.py")
+    _spec = _ilu.spec_from_file_location(n, _cand)
+    _s.modules[n] = _m = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_m); return _m
+
 import asyncio
 import logging
 import os
@@ -12,11 +26,19 @@ ConsoleOutputHandler = logging.StreamHandler()
 
 logger = logging.getLogger("quivr_core")
 logger.setLevel(logging.DEBUG)
+# LINEAJE: enforce() `ConsoleOutputHandler` at agent->log log_emit — scan flagged AI_DAT_SEC_010 (Do not log PII.). Mask/block; do not remove without review. site_id='site:sha256:ec88ec9f4f317cbc06607eda1e80579a21aa22f41f147b6ae4fa095d8c36526b'
+_gr_client = _lineaje_load_gr_client()
+_gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:ec88ec9f4f317cbc06607eda1e80579a21aa22f41f147b6ae4fa095d8c36526b', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_010', 'guardrail_id': 'Mask PII in Logs', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='log')
+ConsoleOutputHandler = _gr_client.enforce(_gr_site, ConsoleOutputHandler, content_type='application/json')
 logger.addHandler(ConsoleOutputHandler)
 
 
 logger = logging.getLogger("megaparse")
 logger.setLevel(logging.DEBUG)
+# LINEAJE: enforce() `ConsoleOutputHandler` at agent->log log_emit — scan flagged AI_DAT_SEC_010 (Do not log PII.). Mask/block; do not remove without review. site_id='site:sha256:679145b7533d2ce2df640a554bd5b463630e3d89aeef18ae92d1dd978add8079'
+_gr_client = _lineaje_load_gr_client()
+_gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:679145b7533d2ce2df640a554bd5b463630e3d89aeef18ae92d1dd978add8079', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_010', 'guardrail_id': 'Mask PII in Logs', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='log')
+ConsoleOutputHandler = _gr_client.enforce(_gr_site, ConsoleOutputHandler, content_type='application/json')
 logger.addHandler(ConsoleOutputHandler)
 
 
@@ -132,6 +154,10 @@ async def main():
     retrieval_config = assistant_config.retrieval_config
     for i, (question, truth) in enumerate(zip(questions, answers, strict=False)):
         chunk = brain.ask(question=question, retrieval_config=retrieval_config)
+        # LINEAJE: enforce() `question` at agent->log log_emit — scan flagged AI_DAT_SEC_010 (Do not log PII.). Mask/block; do not remove without review. site_id='site:sha256:d475d1e22867bfee41f2be2f5cf1116e8eadef2ad2efc1ea7a3071a2208716ec'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:d475d1e22867bfee41f2be2f5cf1116e8eadef2ad2efc1ea7a3071a2208716ec', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_010', 'guardrail_id': 'Mask PII in Logs', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='log')
+        question = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, question, content_type='application/json'))
         print(
             "\n Question: ", question, "\n Answer: ", chunk.answer, "\n Truth: ", truth
         )
