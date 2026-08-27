@@ -1,560 +1,2530 @@
 #!/usr/bin/env python3
-"""Guardrail Repo Scanner (CON-2014) — full-repo insertion-point scan + PR.
+"""Lineaje AI Policy Scanner — GitHub Actions edition.
 
-Clones a repository, detects all unguarded data-transfer points using the
-UniFAI insertion-point scanner, inserts ``guardrail_check()`` stubs into the
-source files, commits to a new branch, and opens a pull request.
+This file is the **standalone** script the GitHub Action copies into the
+runner (``.lineaje-scanner/scripts/gha_repo_scan.py``). The rest of
+``aipo_mcp_server`` is not present there — do not import ``scm_client``,
+``config``, ``mcp_server``, ``adapter``, ``pipeline``, ``gha_stub_insertion``,
+or anything else from this repo. Stdlib only (plus the ``mcp`` client
+package). If ``insertion_point_scanner.py`` happens to sit next to this
+file, a local stub fallback may run; otherwise it is skipped silently.
 
-Unlike the existing ``repo_scan.py`` (which scans for SBOM/vuln violations via
-the MCP pipeline), this script focuses exclusively on guardrail stub coverage.
-It uses NO MCP server — it runs the scanner locally and applies stubs directly.
+Scans already-checked-out source code against Lineaje AI security policies
+and prints results as structured JSON to stdout. Designed to run on a
+GitHub-managed Ubuntu runner where the repository is pre-checked-out.
 
 Usage::
 
-    python scripts/gr_repo_scan.py \\
-        --repo owner/repo \\
-        --branch main \\
-        --tenant-id <your-tenant-id>
+    python scripts/gha_repo_scan.py --source-path .
 
-    # Or scan a local clone (skip the clone step)
-    python scripts/gr_repo_scan.py \\
-        --local-path /path/to/repo \\
-        --tenant-id <your-tenant-id> \\
-        --no-pr
+Output (stdout, JSON)::
 
-Environment variables::
+    {
+      "status": "violations_found | compliant | error",
+      "scan_metadata": {
+        "repo": "owner/repo",
+        "branch": "main",
+        "head_sha": "abc1234",
+        "scanned_at": "2026-05-10T10:00:00Z",
+        "files_scanned": 150,
+        "batches": 2,
+        "failed_batches": 0
+      },
+      "report": "...(markdown policy report)...",
+      "violations": [...],
+      "aibom": [...],
+      "scan_errors": []
+    }
 
-    SCM_PROVIDER         — github | bitbucket | gitlab  (default: github)
-    SCM_ACCESS_TOKEN     — GitHub PAT / Bitbucket app password / GitLab PAT
-    GR_TENANT_ID         — Tenant ID (overridden by --tenant-id)
-    GR_COMPANY_ID        — Company ID (optional)
-    LINEAJE_PAT          — Lineaje PAT for GR service auth + Data Service upload
+Required environment variable::
+
+    LINEAJE_PAT_TOKEN  — Lineaje refresh token (exchanged for short-lived access tokens
+                          at SCIM renew-access-token). Override with
+                          LINEAJE_RENEW_ACCESS_TOKEN_URL or SCIM_SERVICE_URL.
 
 Exit codes::
 
-    0 — scan complete (violations found + PR opened, or no violations)
+    0 — scan completed (check "status" field)
     1 — runtime error
-    2 — configuration error
+    2 — configuration error (missing LINEAJE_PAT_TOKEN, missing repo/branch)
 """
+
 from __future__ import annotations
 
 import argparse
+import ast
+import asyncio
+import base64
+import fnmatch
+import io
 import json
 import logging
 import os
+import pathlib
+import re
 import subprocess
 import sys
+import tarfile
 import tempfile
-from pathlib import Path
-from typing import Any
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# ── Path setup so we can import insertion_point_scanner from parent dir ───────
-_HERE = Path(__file__).resolve().parent
-_PARENT = _HERE.parent
-for _p in (_HERE, _PARENT):
-    if str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
+logger = logging.getLogger("gha_repo_scan")
 
-from scm_client import create_scm_client  # noqa: E402
-from insertion_point_scanner import (  # noqa: E402
-    scan_project, _import_hint, safe_prefix_insert_index, validate_python_source,
+# ===========================================================================
+# Standalone file-collection helpers (inlined from config.py)
+# ===========================================================================
+# This script is deployed on its own into a target repo's
+# .lineaje-scanner/scripts/ by the GitHub Action — the rest of the
+# aipo_mcp_server repo (including config.py) is not present there, so it
+# must not import from config.py or anywhere else in this repo. Everything
+# below is a straight copy of config.py's MANIFEST_FILE_PATTERNS /
+# ARCHIVE_EXCLUDE_* / list_files_for_archive() / EVIDENCE_TYPE_SCM_SCAN —
+# keep both copies in sync if the source changes.
+
+EVIDENCE_TYPE_SCM_SCAN = "scm_scan"
+
+MANIFEST_FILE_PATTERNS: frozenset = frozenset(
+    {
+        # Python
+        "requirements.txt", "requirements-dev.txt", "requirements-test.txt",
+        "Pipfile", "Pipfile.lock", "pyproject.toml", "setup.py", "setup.cfg",
+        "poetry.lock",
+        # Python — conda
+        "environment.yml", "environment.yaml",
+        # JavaScript/Node.js
+        "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock",
+        # Java
+        "pom.xml", "build.gradle", "build.gradle.kts", "gradle.lockfile",
+        # Scala
+        "build.sbt",
+        # Ruby
+        "Gemfile", "Gemfile.lock",
+        # Go
+        "go.mod", "go.sum",
+        # Rust
+        "Cargo.toml", "Cargo.lock",
+        # .NET
+        "packages.config", "packages.lock.json", "*.csproj", "*.fsproj",
+        "*.vbproj", "nuget.config", "Directory.Packages.props",
+        # PHP
+        "composer.json", "composer.lock",
+        # Swift
+        "Package.swift", "Package.resolved",
+        # Dart / Flutter
+        "pubspec.yaml", "pubspec.lock",
+        # Elixir
+        "mix.exs", "mix.lock",
+        # Ruby gemspec
+        "*.gemspec",
+    }
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-)
-_logger = logging.getLogger("gr_repo_scan")
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-
-_STUB_BRANCH_PREFIX = "unifai/guardrail-stubs"
-_PR_TITLE_TEMPLATE = "chore: add UniFAI guardrail stubs ({count} insertion point(s))"
-_COMMENT_MARKER = "<!-- unifai-gr-repo-scan -->"
-_BOT_PR_BODY_TEMPLATE = """\
-{marker}
-## UniFAI Guardrail Stub Insertion
-
-This PR was generated automatically by `gr_repo_scan.py` (CON-2014).
-
-**{count} unguarded insertion point(s)** were detected across **{files} file(s)**:
-
-{table}
-
-{components_section}
-### What was inserted
-For each detected boundary crossing a `guardrail_check()` call was added.
-The stub forwards data to the Lineaje GR service for policy evaluation
-(PII redaction, content filtering, etc.) and returns the transformed payload.
-
-### Setup
-```bash
-pip install httpx
-# Set in your environment:
-export GR_SERVICE_URL=http://localhost:8001
-export GR_TENANT_ID={tenant_id}
-```
-
-> Generated by [UniFAI Guardrail Scanner](https://lineaje.com)
-"""
-
-_COMPONENTS_SECTION_TEMPLATE = """\
-### AI Components Discovered ({count})
-
-| Name | Type | Framework | Source File |
-|---|---|---|---|
-{rows}
-
-"""
-
-
-# ── Git helpers ───────────────────────────────────────────────────────────────
-
-def _git_clone(repo: str, branch: str, dest: str, token: str, provider: str) -> None:
-    if provider == "github":
-        url = f"https://x-access-token:{token}@github.com/{repo}.git"
-    elif provider == "bitbucket":
-        user = os.environ.get("SCM_USERNAME", "x-token-auth")
-        url = f"https://{user}:{token}@bitbucket.org/{repo}.git"
-    else:
-        url = f"https://oauth2:{token}@gitlab.com/{repo}.git"
-
-    _logger.info("Cloning %s@%s …", repo, branch)
-    subprocess.run(
-        ["git", "clone", "--depth=1", "--branch", branch, url, dest],
-        check=True,
-        capture_output=True,
+def _is_manifest_file(name: str) -> bool:
+    """True if *name* matches ``MANIFEST_FILE_PATTERNS`` (exact or glob)."""
+    if name in MANIFEST_FILE_PATTERNS:
+        return True
+    return any(
+        fnmatch.fnmatch(name, pat)
+        for pat in MANIFEST_FILE_PATTERNS
+        if "*" in pat or "?" in pat
     )
 
 
-def _git_head_sha(clone_dir: str) -> str:
-    result = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
-        cwd=clone_dir,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip()
+ARCHIVE_EXCLUDE_DIRS: frozenset = frozenset(
+    {
+        ".git", ".gitignore", ".gitattributes", ".gitmodules", ".hg", ".svn",
+        ".env", ".env.local", ".env.development", ".env.production",
+        "__pycache__", ".pytest_cache", "venv", ".venv", ".venv-scan", "env", ".tox",
+        "htmlcov", ".coverage", ".mypy_cache", ".ruff_cache",
+        "node_modules", ".yarn", ".pnp",
+        "dist", "build", ".next", ".nuxt", "out", "coverage", ".cache",
+        "target", ".gradle", ".m2",
+        "Pods", ".expo",
+        ".idea", ".vscode",
+        ".lineaje-aiepo-security",
+        ".lineaje",
+        "migrations", "alembic",
+    }
+)
+
+ARCHIVE_EXCLUDE_GLOBS: frozenset = frozenset(
+    {
+        "*.secret", "*.key", "*.pem", "*.env.*",
+        "*.zip", "*.tar", "*.tar.gz", "*.jar", "*.war", "*.swp", "*.swo",
+        "*.lock", "package-lock.json", "yarn.lock", "Pipfile.lock",
+        "poetry.lock", "Gemfile.lock", "Cargo.lock", "composer.lock",
+        "*.min.js", "*.min.css", "*.map",
+        "*_pb2.py", "*.pb.go", "*.pb.cc", "*.pb.h",
+        "*.snap",
+    }
+)
+
+BINARY_EXTENSIONS: frozenset = frozenset(
+    {
+        ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp", ".svg",
+        ".woff", ".woff2", ".ttf", ".eot", ".otf",
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
+        ".exe", ".dll", ".so", ".dylib", ".class", ".jar", ".war",
+        ".pyc", ".pyo", ".o", ".a",
+        ".mp3", ".mp4", ".avi", ".mov", ".wav", ".flac",
+        ".db", ".sqlite", ".sqlite3",
+    }
+)
+
+_ARCHIVE_EXCLUDE_DIR_GLOBS: tuple = (".venv-*", "venv-*")
 
 
-def _read_file(path: str) -> str:
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        return f.read()
+def _git_ls_files_archive_command(repo_path: str) -> List[str]:
+    """``git ls-files`` argv that skips the same paths the upload archive tool skips.
 
-
-def _write_file(path: str, content: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-
-# ── Stub application ──────────────────────────────────────────────────────────
-
-def _apply_stubs(candidates: list, clone_dir: str, skip_unsafe: bool = True) -> dict[str, str]:
-    """Apply stub insertions to files in clone_dir. Returns {rel_path: new_content}.
-
-    skip_unsafe=True (default) drops any candidate the scanner itself marked
-    safe_to_insert=False before doing anything else — this was previously
-    NOT enforced here at all (every candidate passed in was applied
-    regardless of the scanner's own confidence, unlike every other write
-    path in this codebase). Pass skip_unsafe=False for a caller that has
-    already made its own informed choice to include unsafe candidates (see
-    scripts/apply_gr_stubs_local.py's ``--include-unsafe`` flag) — otherwise
-    that opt-in would be silently defeated by this function re-filtering
-    what the caller explicitly asked to keep.
-
-    Shares its safety-critical logic — loader/import placement that avoids
-    landing above a module docstring or a `from __future__ import` line, and
-    whole-file compile() validation for Python — with
-    guardrail_stub_insertion.py's write path via
-    insertion_point_scanner.safe_prefix_insert_index() /
-    validate_python_source() (Independent Code Review's "two unconverged
-    write paths" finding, docs/CODE_REVIEW_ADDENDUM_2026-08-10.md recommended
-    fix #4). The two paths still differ in what gets inserted — this script
-    scans for every unguarded insertion point across a whole repo with no
-    violation input at all, guardrail_stub_insertion.py only instruments
-    candidates an actual evaluator violation lands on — that's a genuine,
-    intentional difference in scope, not drift. What's shared now is "is
-    this candidate even insertable" and "is the result still valid Python",
-    the two questions previously answered by independently maintained copies
-    that had silently diverged (this path had neither the safe_to_insert
-    filter nor any syntax validation at all until this fix).
+    ``--exclude-standard`` honors ``.gitignore``. ``-x`` drops matching *untracked*
+    files. ``:(exclude,glob)`` pathspecs also drop *tracked* vendor dirs, lockfiles,
+    binaries, and dependency manifests so a GHA checkout does not pack them.
     """
-    by_file: dict[str, list] = {}
-    for c in candidates:
-        if skip_unsafe and not getattr(c, "safe_to_insert", True):
-            _logger.info(
-                "Skip %s:%s [%s] unsafe — %s", c.file, c.line, c.insertion_point, c.skip_reason,
-            )
-            continue
-        by_file.setdefault(c.file, []).append(c)
+    cmd: List[str] = [
+        "git", "-C", repo_path, "ls-files", "-z", "--cached", "--others", "--exclude-standard",
+    ]
+    x_patterns: List[str] = [
+        *sorted(ARCHIVE_EXCLUDE_DIRS),
+        *sorted(ARCHIVE_EXCLUDE_GLOBS),
+        *sorted(MANIFEST_FILE_PATTERNS),
+        *[f"*{ext}" for ext in sorted(BINARY_EXTENSIONS)],
+        *_ARCHIVE_EXCLUDE_DIR_GLOBS,
+    ]
+    for pattern in x_patterns:
+        cmd.extend(["-x", pattern])
+    cmd.extend(["--", "."])
+    for name in sorted(ARCHIVE_EXCLUDE_DIRS):
+        cmd.append(f":(exclude,glob){name}")
+        cmd.append(f":(exclude,glob){name}/**")
+        cmd.append(f":(exclude,glob)**/{name}")
+        cmd.append(f":(exclude,glob)**/{name}/**")
+    for pat in (*sorted(ARCHIVE_EXCLUDE_GLOBS), *sorted(MANIFEST_FILE_PATTERNS)):
+        cmd.append(f":(exclude,glob){pat}")
+        if not pat.startswith("**/"):
+            cmd.append(f":(exclude,glob)**/{pat}")
+    for ext in sorted(BINARY_EXTENSIONS):
+        cmd.append(f":(exclude,glob)*{ext}")
+        cmd.append(f":(exclude,glob)**/*{ext}")
+    for pat in _ARCHIVE_EXCLUDE_DIR_GLOBS:
+        cmd.append(f":(exclude,glob){pat}")
+        cmd.append(f":(exclude,glob){pat}/**")
+        cmd.append(f":(exclude,glob)**/{pat}")
+        cmd.append(f":(exclude,glob)**/{pat}/**")
+    return cmd
 
-    changed: dict[str, str] = {}
+
+def _list_git_files_for_archive(repo_path: str) -> Optional[List[str]]:
+    """Repo-relative files from ``_git_ls_files_archive_command``.
+
+    Returns ``None`` if *repo_path* is not a git work tree or git cannot run.
+    """
+    try:
+        proc = subprocess.run(
+            _git_ls_files_archive_command(repo_path),
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    files: List[str] = []
+    for chunk in proc.stdout.split(b"\0"):
+        if not chunk:
+            continue
+        rel = chunk.decode("utf-8", errors="surrogateescape").replace("\\", "/")
+        while rel.startswith("./"):
+            rel = rel[2:]
+        if not rel:
+            continue
+        full = os.path.join(repo_path, rel)
+        if os.path.isfile(full):
+            files.append(rel)
+    return files
+
+
+def _walk_files_for_archive(root: str) -> List[str]:
+    """``os.walk`` fallback using the same exclude sets as archive upload."""
+    file_list: List[str] = []
+    for dirpath, dirs, filenames in os.walk(root):
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in ARCHIVE_EXCLUDE_DIRS
+            and not any(fnmatch.fnmatch(d, g) for g in _ARCHIVE_EXCLUDE_DIR_GLOBS)
+        ]
+        for fname in filenames:
+            full_path = os.path.join(dirpath, fname)
+            rel_path = os.path.relpath(full_path, root).replace("\\", "/")
+            ext = pathlib.Path(fname).suffix.lower()
+            if ext in BINARY_EXTENSIONS:
+                continue
+            if _is_manifest_file(fname):
+                continue
+            if any(fnmatch.fnmatch(rel_path, g) for g in ARCHIVE_EXCLUDE_GLOBS):
+                continue
+            if any(part in ARCHIVE_EXCLUDE_DIRS for part in pathlib.Path(rel_path).parts):
+                continue
+            file_list.append(rel_path)
+    return file_list
+
+
+def list_files_for_archive(repo_path: str) -> List[str]:
+    """Prefer ``git ls-files`` with upload-tool excludes; walk if git is unavailable."""
+    listed = _list_git_files_for_archive(repo_path)
+    if listed is not None:
+        return listed
+    return _walk_files_for_archive(repo_path)
+
+
+# Inlined from pipeline/report/consolidate.py — this script cannot import
+# that module (or anything else from aipo_mcp_server) on a GHA runner.
+_METRIC_HEADER_KEYS = frozenset({
+    "|metric|count|",
+    "|metric|value|",
+    "|phase|time|",
+})
+_PLACEHOLDER_SNIPPETS = (
+    "no policies with violations",
+    "no controls enforced",
+    "no skill policy violations",
+    "no skill controls enforced",
+    "no ai components",
+    "no files scanned",
+)
+
+
+def _is_no_change_report(md: str) -> bool:
+    text = md or ""
+    return "## No Files Changed" in text or "Analysis was skipped" in text
+
+
+def _norm_md_line(line: str) -> str:
+    return " ".join((line or "").strip().split())
+
+
+def _md_header_key(line: str) -> str:
+    return "|".join(p.strip().lower() for p in _norm_md_line(line).split("|"))
+
+
+def _is_separator_row(line: str) -> bool:
+    s = (line or "").strip()
+    if not s.startswith("|"):
+        return False
+    return bool(s) and all(c in "-:| " for c in s)
+
+
+def _is_metric_header(header_line: str) -> bool:
+    return _md_header_key(header_line) in _METRIC_HEADER_KEYS
+
+
+def _is_placeholder_row(line: str) -> bool:
+    low = (line or "").lower()
+    return any(snippet in low for snippet in _PLACEHOLDER_SNIPPETS)
+
+
+def _extract_md_tables(md: str) -> List[List[str]]:
+    lines = (md or "").splitlines()
+    tables: List[List[str]] = []
+    i = 0
+    while i < len(lines):
+        if (
+            lines[i].strip().startswith("|")
+            and i + 1 < len(lines)
+            and _is_separator_row(lines[i + 1])
+        ):
+            start = i
+            i += 2
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                i += 1
+            tables.append(lines[start:i])
+        else:
+            i += 1
+    return tables
+
+
+def _consolidate_batch_reports(reports: List[str]) -> str:
+    """Union per-batch markdown tables into one report (stdlib-only)."""
+    cleaned = [
+        r.strip() for r in reports
+        if (r or "").strip() and not _is_no_change_report(r)
+    ]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0] if cleaned[0].endswith("\n") else cleaned[0] + "\n"
+
+    extra_rows: Dict[str, List[str]] = {}
+    extra_seen: Dict[str, set] = {}
+    first_keys: set = set()
+    for table in _extract_md_tables(cleaned[0]):
+        if table:
+            first_keys.add(_md_header_key(table[0]))
+
+    orphan_tables: List[List[str]] = []
+    seen_orphan_keys: set = set()
+
+    for report in cleaned[1:]:
+        for table in _extract_md_tables(report):
+            if len(table) < 2 or _is_metric_header(table[0]):
+                continue
+            key = _md_header_key(table[0])
+            if key not in first_keys:
+                if key not in seen_orphan_keys:
+                    orphan_tables.append(table)
+                    seen_orphan_keys.add(key)
+                continue
+            bucket = extra_rows.setdefault(key, [])
+            seen = extra_seen.setdefault(key, set())
+            for row in table[2:]:
+                if _is_placeholder_row(row):
+                    continue
+                norm = _norm_md_line(row)
+                if not norm or norm in seen:
+                    continue
+                seen.add(norm)
+                bucket.append(row)
+
+    lines = cleaned[0].splitlines()
+    out: List[str] = []
+    i = 0
+    while i < len(lines):
+        if (
+            lines[i].strip().startswith("|")
+            and i + 1 < len(lines)
+            and _is_separator_row(lines[i + 1])
+        ):
+            header = lines[i]
+            sep = lines[i + 1]
+            key = _md_header_key(header)
+            data_rows: List[str] = []
+            i += 2
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                data_rows.append(lines[i])
+                i += 1
+            extras = extra_rows.get(key, []) if not _is_metric_header(header) else []
+            if extras:
+                data_rows = [r for r in data_rows if not _is_placeholder_row(r)]
+            seen_local = {_norm_md_line(r) for r in data_rows}
+            for row in extras:
+                norm = _norm_md_line(row)
+                if norm not in seen_local:
+                    seen_local.add(norm)
+                    data_rows.append(row)
+            out.append(header)
+            out.append(sep)
+            out.extend(data_rows)
+            continue
+        out.append(lines[i])
+        i += 1
+
+    if orphan_tables:
+        out.append("")
+        for table in orphan_tables:
+            out.extend(table)
+            out.append("")
+
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _combine_scan_reports(reports: List[str]) -> str:
+    """Union per-batch markdown tables into one report (fallback: concatenate)."""
+    nonempty = [r for r in reports if r]
+    if not nonempty:
+        return ""
+    try:
+        return _consolidate_batch_reports(nonempty)
+    except Exception:
+        return "\n\n---\n\n".join(nonempty)
+
+
+# ===========================================================================
+# Constants
+# ===========================================================================
+
+MCP_SERVER_URL = "https://mcp.commercialdev.dev.veedna.com/mcp/"
+# MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
+
+MAX_SCAN_WORKERS = 4
+REMEDIATION_BRANCH_PREFIX = "remediation/unifai-gha"
+DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
+# GitHub rejects POST /pulls with HTTP 422 when body > 65536 chars.
+GITHUB_PR_BODY_SAFE_LIMIT = 60_000
+_PR_BODY_TRUNCATION_NOTE = (
+    "\n\n---\n\n"
+    "*…Report truncated for GitHub PR body size limit. "
+    "Retrieve the full text from CI logs.*"
+)
+
+_DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC = 120
+
+# UI / GHA ``LINEAJE_PAT_TOKEN`` is a SCIM-issued refresh token. Identity-service
+# ``/lineajeidentity/.../renew-access-token`` cannot decrypt it (HTTP 500
+# "trying to decrypt the string"). Exchange at SCIM instead.
+_SCIM_RENEW_ACCESS_TOKEN_PATH = "/scim/api/v1/auth/native/renew-access-token"
+_IDENTITY_RENEW_ACCESS_TOKEN_PATH = "/lineajeidentity/api/v1/auth/native/renew-access-token"
+_SCIM_SERVICE_URL_DEFAULT = "https://scim-service.commercialdev.dev.veedna.com"
+_LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
+    _SCIM_SERVICE_URL_DEFAULT + _SCIM_RENEW_ACCESS_TOKEN_PATH
+)
+
+_LINEAJE_IDENTITY_SERVICE_URL_DEFAULT = (
+    "https://lineaje-identity-service.commercialdev.dev.veedna.com"
+)
+
+_PAT_INTROSPECT_PATH = "/lineajeidentity/api/v1/pat/introspect"
+
+# ===========================================================================
+# Token helpers
+# ===========================================================================
+
+def _normalize_token(raw: Any) -> str:
+    if raw is None:
+        return ""
+    s = str(raw).strip().lstrip("﻿").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        s = s[1:-1].strip()
+    return s
+
+
+def _normalize_url(url: Optional[str]) -> str:
+    if url is None:
+        return ""
+    u = str(url).strip()
+    if len(u) >= 2 and u[0] == u[-1] and u[0] in "\"'":
+        u = u[1:-1].strip()
+    return u
+
+
+def _scim_renew_url_from_identity_url(url: str) -> str:
+    """Map identity-service renew URLs onto the SCIM equivalent.
+
+    SCIM-issued refresh tokens fail at identity with HTTP 500
+    ``trying to decrypt the string``.
+    """
+    u = (url or "").strip().rstrip("/")
+    if not u or _IDENTITY_RENEW_ACCESS_TOKEN_PATH not in u:
+        return u
+    parsed = urllib.parse.urlparse(u)
+    host = (parsed.netloc or "").replace("lineaje-identity-service", "scim-service")
+    scheme = parsed.scheme or "https"
+    return f"{scheme}://{host}{_SCIM_RENEW_ACCESS_TOKEN_PATH}"
+
+
+def _resolve_renew_access_token_url(explicit: Optional[str] = None) -> str:
+    """SCIM renew-access-token URL for a GHA/UI refresh token.
+
+    Order: explicit arg, LINEAJE_RENEW_ACCESS_TOKEN_URL, {SCIM_SERVICE_URL}/scim/...,
+    commercialdev SCIM default. Identity-service renew URLs are rewritten to SCIM.
+    """
+    scim_base = _normalize_url(os.environ.get("SCIM_SERVICE_URL")).rstrip("/")
+    derived = f"{scim_base}{_SCIM_RENEW_ACCESS_TOKEN_PATH}" if scim_base else ""
+    raw = (
+        _normalize_url(explicit)
+        or _normalize_url(os.environ.get("LINEAJE_RENEW_ACCESS_TOKEN_URL"))
+        or derived
+        or _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD
+    )
+    rewritten = _scim_renew_url_from_identity_url(raw) or raw
+    if rewritten != raw.rstrip("/"):
+        logger.warning(
+            "Auth: renew URL %s is identity-service; using SCIM %s "
+            "(identity cannot decrypt SCIM refresh tokens)",
+            raw, rewritten,
+        )
+    return rewritten.rstrip("/")
+
+
+def _identity_token_response_dict(raw_text: str, *, context: str) -> dict:
+    text = raw_text.strip() if raw_text else ""
+    try:
+        parsed: Any = json.loads(raw_text)
+    except json.JSONDecodeError:
+        # Some endpoints return a bare JWT string
+        parts = text.split(".")
+        if context == "renew-access-token" and len(parts) == 3:
+            return {"access_token": text}
+        raise RuntimeError(f"{context}: response is not valid JSON") from None
+    for _ in range(8):
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, str):
+            s = parsed.strip()
+            if not s:
+                raise RuntimeError(f"{context}: empty JSON string where object expected")
+            try:
+                parsed = json.loads(s)
+            except json.JSONDecodeError:
+                parts = s.split(".")
+                if context == "renew-access-token" and len(parts) == 3:
+                    return {"access_token": s}
+                raise RuntimeError(f"{context}: server returned error string: {s[:800]}") from None
+            continue
+        break
+    raise RuntimeError(f"{context}: unexpected JSON type after unwrap: {type(parsed).__name__}")
+
+
+class RefreshTokenTokenManager:
+    """Exchange LINEAJE_PAT_TOKEN (a refresh token) for short-lived MCP bearer tokens,
+    auto-renewing before expiry."""
+
+    def __init__(self, refresh_token: str, renew_access_token_url: Optional[str] = None) -> None:
+        self._refresh_token = _normalize_token(refresh_token)
+        if not self._refresh_token:
+            raise ValueError("LINEAJE_PAT_TOKEN must be non-empty")
+        self._renew_url = _resolve_renew_access_token_url(renew_access_token_url)
+        self._lock = threading.Lock()
+        self._access_token = ""
+        self._access_deadline = 0.0
+        try:
+            self._skew_sec = int(os.environ.get(
+                "LINEAJE_TOKEN_REFRESH_SKEW_SEC", str(_DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC)
+            ))
+        except ValueError:
+            self._skew_sec = _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC
+
+    def get_access_token(self) -> str:
+        with self._lock:
+            return self._get_unlocked()
+
+    def _get_unlocked(self) -> str:
+        now = time.time()
+        if self._access_token and now < self._access_deadline - self._skew_sec:
+            return self._access_token
+        self._renew()
+        if not self._access_token:
+            raise RuntimeError("renew-access-token did not return access_token")
+        return self._access_token
+
+    def _renew(self) -> None:
+        q = urllib.parse.urlencode({"refreshToken": self._refresh_token})
+        url = f"{self._renew_url}?{q}"
+        req = urllib.request.Request(
+            url, data=b"null",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        logger.info("Auth: exchanging refresh token at %s", self._renew_url)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = _identity_token_response_dict(resp.read().decode(), context="renew-access-token")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode(errors="replace")
+            raise RuntimeError(f"renew-access-token HTTP {exc.code}: {body[:800]}") from exc
+        at = (data.get("access_token") or "").strip()
+        if not at:
+            raise RuntimeError(f"Token response missing access_token: {data!r}")
+        self._access_token = at
+        rt = (data.get("refresh_token") or "").strip()
+        if rt:
+            self._refresh_token = rt
+        exp = data.get("expires_in")
+        try:
+            exp_sec = int(exp) if exp is not None else 3600
+        except (TypeError, ValueError):
+            exp_sec = 3600
+        self._access_deadline = time.time() + max(60, exp_sec)
+        logger.debug("Access token renewed; expires in %ds", exp_sec)
+
+
+def _looks_like_jwt_blob(value: str) -> bool:
+    s = value.strip()
+    if s.count(".") != 2:
+        return False
+    hdr, payload, sig = s.split(".")
+    if len(hdr) < 10 or len(payload) < 10 or len(sig) < 10:
+        return False
+    seg = re.compile(r"^[A-Za-z0-9_-]+$")
+    return bool(seg.match(hdr) and seg.match(payload) and seg.match(sig))
+
+
+def _looks_like_already_usable_bearer(value: str) -> bool:
+    """True if *value* is already a Bearer (JWT), not an opaque refresh token."""
+    s = value.strip()
+    if not s:
+        return False
+    return _looks_like_jwt_blob(s)
+
+
+def _tenant_id_from_access_jwt(access_token: str) -> str:
+    """Read tenant_id from the access JWT payload. No PAT introspect.
+
+    Lineaje puts it on ``user_metadata.tenant_id`` (top-level ``tenant_id``
+    is also accepted). Signature is not verified — this token was just
+    minted by renew-access-token over TLS.
+    """
+    if not _looks_like_jwt_blob(access_token):
+        return ""
+    try:
+        payload = access_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return ""
+    if not isinstance(claims, dict):
+        return ""
+    meta = claims.get("user_metadata") if isinstance(claims.get("user_metadata"), dict) else {}
+    for src in (claims, meta):
+        tid = src.get("tenant_id")
+        if isinstance(tid, str) and tid.strip():
+            return tid.strip()
+    return ""
+
+
+
+def _identity_service_base_url() -> str:
+    """Resolve identity service base URL.
+
+    Resolution order:
+      1. LINEAJE_IDENTITY_SERVICE_URL env var
+      2. Host extracted from LINEAJE_FETCH_ACCESS_TOKEN_URL
+      3. Host extracted from LINEAJE_RENEW_ACCESS_TOKEN_URL
+      4. Hardcoded default (_LINEAJE_IDENTITY_SERVICE_URL_DEFAULT)
+    """
+    explicit = os.environ.get("LINEAJE_IDENTITY_SERVICE_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    for env_var in ("LINEAJE_FETCH_ACCESS_TOKEN_URL", "LINEAJE_RENEW_ACCESS_TOKEN_URL"):
+        raw = os.environ.get(env_var, "").strip()
+        if raw:
+            parsed = urllib.parse.urlparse(raw)
+            return f"{parsed.scheme}://{parsed.netloc}"
+    return _LINEAJE_IDENTITY_SERVICE_URL_DEFAULT
+
+
+def introspect_lineaje_pat(pat: str) -> Dict[str, Any]:
+    """Validate a Lineaje PAT via the identity service introspect endpoint."""
+    base = _identity_service_base_url()
+    if not base:
+        raise RuntimeError(
+            "Identity service URL not configured. "
+            "Set LINEAJE_IDENTITY_SERVICE_URL or LINEAJE_FETCH_ACCESS_TOKEN_URL."
+        )
+    url = base + _PAT_INTROSPECT_PATH
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {pat}", "Accept": "application/json"},
+        method="GET",
+    )
+    logger.info("PAT introspect: GET %s", url)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode()
+            logger.info("PAT introspect: HTTP %s", getattr(resp, "status", None) or resp.getcode())
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode(errors="replace")
+        raise RuntimeError(f"PAT introspect HTTP {exc.code}: {err_body[:400]}") from exc
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"PAT introspect returned non-JSON: {raw[:200]}") from exc
+    logger.info(
+        "PAT introspect: user_email=%s tenant_id=%s company_id=%s",
+        info.get("user_email", ""), info.get("tenant_id", ""), info.get("company_id", ""),
+    )
+    return info
+
+
+def _scan_refresh_token(args: Optional[argparse.Namespace] = None) -> str:
+    """PAT / refresh token from ``--lineaje-pat`` / ``--refresh-token`` or GHA env."""
+    cli = ""
+    if args is not None:
+        cli = _normalize_token(
+            getattr(args, "lineaje_pat", None) or getattr(args, "refresh_token", None)
+        )
+    return cli or _normalize_token(
+        os.environ.get("LINEAJE_PAT_TOKEN", "")
+        or os.environ.get("LINEAJE_REFRESH_TOKEN", "")
+    )
+
+
+def build_bearer_getter(refresh_token: str = "") -> Callable[[], str]:
+    """Return a callable that yields the MCP bearer from a refresh token.
+
+    ``--lineaje-pat`` / ``LINEAJE_PAT_TOKEN`` is a refresh token. It is
+    exchanged via renew-access-token. A JWT is used directly as Bearer.
+    """
+    pat = _normalize_token(refresh_token or os.environ.get("LINEAJE_PAT_TOKEN", ""))
+    if not pat:
+        raise RuntimeError("LINEAJE_PAT_TOKEN / --lineaje-pat is not set")
+    if _looks_like_already_usable_bearer(pat):
+        logger.info("LINEAJE_PAT_TOKEN is already a usable access token — using directly as bearer")
+        return lambda: pat
+    logger.info("Auth: treating --lineaje-pat / LINEAJE_PAT_TOKEN as refresh token")
+    mgr = RefreshTokenTokenManager(pat)
+    return mgr.get_access_token
+
+# ===========================================================================
+# File collection
+# ===========================================================================
+
+def collect_repo_files(local_path: str) -> List[str]:
+    """List scannable files via ``git ls-files``; excludes live in the upload tool."""
+    return list_files_for_archive(local_path)
+
+# ===========================================================================
+# Archive creation
+# ===========================================================================
+
+def _norm_archive_rel_path(p: str) -> str:
+    s = p.strip().replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return s
+
+
+def create_batch_archive(
+    source_dir: str,
+    archive_dir: str,
+    file_subset: List[str],
+    source_code_repo: str,
+    branch: str,
+    head_sha: str,
+    batch_index: int = 0,
+    run_id: str = "",
+    manifest_files: Optional[List[str]] = None,
+) -> str:
+    archive_path = os.path.join(archive_dir, f"repo_scan_batch_{batch_index}.tar.gz")
+    extra_manifests = [m for m in (manifest_files or []) if m not in file_subset]
+    all_files = list(file_subset) + extra_manifests
+    with tarfile.open(archive_path, "w:gz") as tf:
+        for rel_path in all_files:
+            full_path = os.path.join(source_dir, rel_path)
+            if os.path.isfile(full_path):
+                tf.add(full_path, arcname=rel_path, recursive=False)
+        metadata = {
+            "scan_source": "gha_repo_scan",
+            "repo": source_code_repo,
+            "branch": branch,
+            "head_sha": head_sha,
+            "scan_type": "full_repository",
+            "evidence_type": EVIDENCE_TYPE_SCM_SCAN,
+            "batch_index": batch_index,
+            "batch_file_count": len(file_subset),
+            "manifest_file_count": len(extra_manifests),
+        }
+        metadata_bytes = json.dumps(metadata, indent=2).encode("utf-8")
+        metadata_info = tarfile.TarInfo(name="user_metadata.json")
+        metadata_info.size = len(metadata_bytes)
+        tf.addfile(metadata_info, io.BytesIO(metadata_bytes))
+    size_kb = os.path.getsize(archive_path) // 1024
+    logger.info(
+        "Batch archive #%d: %d files + %d manifests, %d KB",
+        batch_index, len(file_subset), len(extra_manifests), size_kb,
+    )
+    return archive_path
+
+
+def _batch_size(total_files: int) -> int:
+    raw = (os.environ.get("UNIFAI_FILE_BATCH_SIZE") or "").strip()
+    if not raw:
+        return DEFAULT_UNIFAI_FILE_BATCH_SIZE
+    try:
+        size = int(raw)
+    except ValueError:
+        return DEFAULT_UNIFAI_FILE_BATCH_SIZE
+    if size <= 0:
+        return max(1, total_files)
+    return size
+
+# ===========================================================================
+# MCP scan (SDK path only)
+# ===========================================================================
+
+def _upload_to_s3(presigned_url: str, archive_path: str) -> None:
+    size = os.path.getsize(archive_path)
+    logger.info("Uploading %d KB to S3 ...", size // 1024)
+    with open(archive_path, "rb") as f:
+        content_type = "application/gzip" if archive_path.endswith((".tar.gz", ".tgz")) else "application/zip"
+        req = urllib.request.Request(
+            presigned_url, data=f.read(), method="PUT",
+            headers={"Content-Type": content_type},
+        )
+        with urllib.request.urlopen(req) as resp:
+            if resp.status not in (200, 204):
+                raise RuntimeError(f"S3 upload failed: HTTP {resp.status}")
+    logger.info("S3 upload complete")
+
+
+def _parse_tool_result(result: Any) -> dict:
+    if hasattr(result, "content") and result.content:
+        raw = result.content[0].text if hasattr(result.content[0], "text") else str(result.content[0])
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {"raw": raw}
+    return {"raw": "empty response"}
+
+
+def _run_mcp_scan_via_client(
+    server_url: str,
+    bearer_getter: Callable[[], str],
+    source_code_repo: str,
+    branch: str,
+    files_to_scan: List[str],
+    archive_path: str,
+    head_sha: str = "",
+) -> Dict[str, Any]:
+    from mcp.client.streamable_http import streamablehttp_client
+    from mcp import ClientSession
+
+    async def _scan() -> Dict[str, Any]:
+        upload_args: Dict[str, Any] = {
+            "source_code_repo": source_code_repo,
+            "branch_or_tag": branch,
+            "files_to_scan": files_to_scan,
+        }
+        # Only known to the SCM/CI script — a coding agent (Cursor/Claude Code) has no
+        # way to set a custom transport header, so this signal cannot leak into IDE scans.
+        scm_headers: Dict[str, str] = {"X-Unifai-Commit-Sha": head_sha} if head_sha else {}
+
+        tok1 = bearer_getter()
+        async with streamablehttp_client(
+            server_url, headers={"Authorization": f"Bearer {tok1}", **scm_headers},
+        ) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                logger.info("MCP step 1/3: get_upload_url")
+                upload_result = _parse_tool_result(
+                    await session.call_tool("get_upload_url", arguments=upload_args)
+                )
+                if not upload_result.get("success"):
+                    raise RuntimeError(f"get_upload_url failed: {upload_result.get('error', upload_result)}")
+                archive_id = upload_result["archive_id"]
+                presigned_url = upload_result["presigned_url"]
+
+        logger.info("MCP step 2/3: upload to S3")
+        _upload_to_s3(presigned_url, archive_path)
+
+        tok2 = bearer_getter()
+        sse_timeout = int(os.environ.get("UNIFAI_MCP_SSE_READ_TIMEOUT", "1800"))
+        async with streamablehttp_client(
+            server_url,
+            headers={"Authorization": f"Bearer {tok2}", **scm_headers},
+            sse_read_timeout=sse_timeout,
+        ) as (read2, write2, _):
+            async with ClientSession(read2, write2) as session2:
+                await session2.initialize()
+                logger.info("MCP step 3/3: analyze_uploaded_archive (timeout=%ds)", sse_timeout)
+                analyze_args = dict(upload_args)
+                analyze_args["archive_id"] = archive_id
+                # We already know the exact URL we used to reach this server -- more
+                # reliable than any guess the server itself could make about its own
+                # public address. Every other caller of this tool leaves this "" (the
+                # server-side default) and gets the server's own resolution instead.
+                analyze_args["mcp_server_location"] = server_url
+                analyze_args["scan_type"] = EVIDENCE_TYPE_SCM_SCAN
+                result = _parse_tool_result(
+                    await session2.call_tool("analyze_uploaded_archive", arguments=analyze_args)
+                )
+                return result
+
+    return asyncio.run(_scan())
+
+
+def run_mcp_scan(
+    server_url: str,
+    bearer_getter: Callable[[], str],
+    source_code_repo: str,
+    branch: str,
+    files_to_scan: List[str],
+    archive_path: str,
+    head_sha: str = "",
+) -> Dict[str, Any]:
+    logger.info("MCP scan: %d files, repo=%s, branch=%s", len(files_to_scan), source_code_repo, branch)
+    return _run_mcp_scan_via_client(
+        server_url, bearer_getter, source_code_repo, branch, files_to_scan, archive_path, head_sha=head_sha,
+    )
+
+# ===========================================================================
+# Guardrail stub insertion (standalone — no sibling-file / repo dependency)
+# ===========================================================================
+#
+# analyze_uploaded_archive already computes "stub_insertions" server-side
+# (adapter.py's _scan_stub_insertions_readonly, same insertion_point_scanner.py
+# logic the MCP server itself uses) and returns it in each batch's JSON
+# response — file, line, proposed_stub (the exact code to insert),
+# import_needed (the gr_check()-family helper for that language, inlined once
+# per file), safe_to_insert, skip_reason, insert_after. Applying it here needs
+# nothing beyond that JSON + stdlib: no gha_stub_insertion.py, no checkout of
+# the aipo_mcp_server pipeline alongside this script. That older path
+# (gha_stub_insertion.py) additionally re-derived stubs locally via
+# pipeline/stub/guardrail_stub_insertion.py — a much heavier, SiteDescriptor/
+# companion-module design requiring this repo's full pipeline package on the
+# runner, which a truly standalone script (this one, meant to be the only
+# Lineaje file a customer's workflow needs) can't assume.
+
+# Per-language marker proving the shared gr_check()-family helper this
+# extension's import_needed text defines is already present in a file — skip
+# re-inserting it (harmless duplicate `def`/`function` in Python/JS, but a
+# real SyntaxError for a duplicate top-level `class`/`func` in Java/Go).
+_GR_CHECK_MARKERS: Dict[str, str] = {
+    ".py": "def gr_check(",
+    ".js": "function gr_check(",
+    ".jsx": "function gr_check(",
+    ".ts": "function gr_check(",
+    ".tsx": "function gr_check(",
+    ".go": "func grCheck(",
+    ".java": "class GrClient {",
+}
+
+
+def _module_prefix_insert_index(lines: List[str]) -> int:
+    """0-indexed position to insert a new top-level block at — after any
+    shebang/encoding comment AND after a leading module docstring, if
+    present. Only the first statement in a Python file is its module
+    docstring; inserting above it silently demotes it to a dead string-
+    literal expression. Falls back to shebang/encoding-only detection for
+    non-Python sources — never raises."""
+    idx = 0
+    for i, ln in enumerate(lines[:5]):
+        if ln.startswith("#!") or ln.strip().startswith("# -*-"):
+            idx = i + 1
+        if ln.startswith("package "):
+            idx = max(idx, i + 1)
+    try:
+        tree = ast.parse("".join(lines))
+        first = tree.body[0] if tree.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(getattr(first, "value", None), ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            idx = max(idx, first.end_lineno)
+    except SyntaxError:
+        pass
+    return idx
+
+
+def safe_prefix_insert_index(lines: List[str]) -> int:
+    """Like _module_prefix_insert_index(), but also walks past any leading
+    `from __future__ import` line(s) — those must be the first statement(s)
+    in a Python file; inserting anything above one is a real SyntaxError."""
+    insert_at = _module_prefix_insert_index(lines)
+    while insert_at < len(lines) and lines[insert_at].lstrip().startswith("from __future__ import"):
+        insert_at += 1
+    return insert_at
+
+
+def validate_python_source(new_content: str, abs_path: str) -> Optional[str]:
+    """Whole-file compile() check after a stub insertion. Returns None if
+    still valid, else the SyntaxError message. compile(), not ast.parse() —
+    ast.parse() does not enforce future-import placement."""
+    try:
+        compile(new_content, abs_path, "exec")
+        return None
+    except SyntaxError as exc:
+        return str(exc)
+
+
+def _stub_insertions_from_mcp_result(mcp_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Merge stub_insertions with patched_files / companion_files from the MCP response."""
+    stubs = [dict(s) for s in (mcp_result.get("stub_insertions") or [])]
+    by_file: Dict[str, str] = {}
+    for extra in list(mcp_result.get("patched_files") or []) + list(mcp_result.get("companion_files") or []):
+        if not isinstance(extra, dict):
+            continue
+        rel = (extra.get("file") or "").strip().replace("\\", "/")
+        if rel and extra.get("content") is not None:
+            by_file[rel] = extra["content"]
+    if not by_file:
+        return stubs
+    applied: set = set()
+    for s in stubs:
+        rel = (s.get("file") or "").strip().replace("\\", "/")
+        if rel in by_file:
+            s["new_content"] = by_file[rel]
+            s["status"] = "detected"
+            s["safe_to_insert"] = True
+            applied.add(rel)
+    for rel, content in by_file.items():
+        if rel not in applied:
+            stubs.append({
+                "file": rel,
+                "status": "detected",
+                "safe_to_insert": True,
+                "new_content": content,
+                "line": 0,
+            })
+    return stubs
+
+
+def apply_stub_insertions_to_clone(
+    stub_insertions: List[Dict[str, Any]],
+    source_dir: str,
+) -> Tuple[Dict[str, str], List[str]]:
+    """Apply the server-computed stub_insertions to files under source_dir.
+
+    Returns ``(validated_fixes, failed_or_skipped)`` — validated_fixes maps
+    repo-relative path -> new file content, ready for _create_fix_pr.
+    """
+    by_file: Dict[str, List[Dict[str, Any]]] = {}
+    skipped: List[str] = []
+    validated: Dict[str, str] = {}
+    for s in stub_insertions:
+        rel = (s.get("file") or "").strip().replace("\\", "/")
+        if not rel:
+            continue
+        if s.get("status") != "detected":
+            continue  # "already_present" — nothing to do
+        if s.get("new_content"):
+            # Server already instrumented the extracted archive — write the
+            # whole file rather than re-applying proposed_stub line-by-line.
+            validated[rel] = s["new_content"]
+            continue
+        if not s.get("safe_to_insert"):
+            skipped.append(f"{rel}:{s.get('line', '')} {s.get('skip_reason', '') or 'unsafe'}".strip())
+            continue
+        by_file.setdefault(rel, []).append(s)
+
     for rel_path, hits in by_file.items():
-        abs_path = os.path.join(clone_dir, rel_path)
+        abs_path = os.path.join(source_dir, rel_path)
         if not os.path.isfile(abs_path):
-            _logger.warning("File not found in clone: %s — skipping", rel_path)
+            skipped.append(f"{rel_path} not found in checkout")
             continue
 
-        lines = _read_file(abs_path).splitlines(keepends=True)
-        ext = Path(rel_path).suffix
+        with open(abs_path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        ext = pathlib.Path(rel_path).suffix.lower()
 
-        # Sort hits descending by line so inserting doesn't shift earlier offsets
-        sorted_hits = sorted(hits, key=lambda h: h.line, reverse=True)
-
-        import_line = _import_hint(ext) + "\n"
+        # Insert bottom-up so an earlier insertion never shifts a later hit's
+        # (already-captured) line number out from under it.
+        sorted_hits = sorted(hits, key=lambda h: h.get("line", 0), reverse=True)
         needs_import = False
-
         for hit in sorted_hits:
-            # 1-based line; insert_after=True (result/lhs patterns, e.g.
-            # db_read) must land AFTER the line that assigns the variable
-            # the stub references — inserting before is a NameError.
-            idx = max(0, hit.line if getattr(hit, "insert_after", False) else hit.line - 1)
-            stub_line = hit.proposed_stub + "\n"
-            lines.insert(idx, stub_line)
+            proposed = hit.get("proposed_stub") or ""
+            if not proposed:
+                continue
+            line = int(hit.get("line") or 0)
+            # 1-based line; insert_after=True (result/lhs patterns) must land
+            # AFTER the line assigning the variable the stub references —
+            # inserting before it is a NameError.
+            idx = max(0, line if hit.get("insert_after") else line - 1)
+            idx = min(idx, len(lines))
+            lines.insert(idx, proposed + "\n")
             needs_import = True
 
         if needs_import:
-            # Skip re-inserting the inlined gr_check()/GRBlockedError block
-            # if a prior run already added it — harmless shadowing for
-            # Python, but a duplicate top-level function/class declaration
-            # is a real SyntaxError for JS/TS.
-            _marker = "function gr_check(" if ext.lower() in (".js", ".jsx", ".ts", ".tsx") else "def gr_check("
-            if _marker not in "".join(lines):
-                lines.insert(safe_prefix_insert_index(lines), import_line)
+            import_block = next(
+                (h.get("import_needed") for h in hits if h.get("import_needed")), "",
+            )
+            marker = _GR_CHECK_MARKERS.get(ext, "def gr_check(")
+            if import_block and marker not in "".join(lines):
+                lines.insert(safe_prefix_insert_index(lines), import_block.rstrip("\n") + "\n")
 
         new_content = "".join(lines)
-
-        # Whole-file syntax validation — Python only, compile() has no
-        # equivalent for JS/TS/Go/Java here, so those still ship without a
-        # validated-result guarantee (documented limitation, not silently
-        # assumed safe).
-        if ext.lower() == ".py":
+        if ext == ".py":
             syntax_err = validate_python_source(new_content, abs_path)
             if syntax_err:
-                _logger.warning(
-                    "Skip %s — would produce invalid syntax (%s), likely the multi-line-call "
-                    "insert_after scanner bug; left untouched", rel_path, syntax_err,
-                )
+                skipped.append(f"{rel_path} would be invalid Python after insertion ({syntax_err})")
                 continue
 
-        changed[rel_path] = new_content
+        validated[rel_path] = new_content
 
-    return changed
-
-
-# ── Markdown helpers ──────────────────────────────────────────────────────────
-
-def _make_table(candidates: list) -> str:
-    by_file: dict[str, list] = {}
-    for c in candidates:
-        by_file.setdefault(c.file, []).append(c)
-
-    rows = ["| File | Line | Insertion Point | Description |",
-            "|---|---|---|---|"]
-    for rel_path, hits in sorted(by_file.items()):
-        for h in sorted(hits, key=lambda x: x.line):
-            rows.append(f"| `{rel_path}` | {h.line} | `{h.insertion_point}` | {h.description} |")
-    return "\n".join(rows)
+    logger.info("Stub insertions applied: %d file(s) changed", len(validated))
+    return validated, skipped
 
 
-def _make_components_section(components: list[dict]) -> str:
-    if not components:
+_GUARDRAIL_MANIFEST_REL = ".lineaje/guardrail.json"
+_HARDCODED_GR_ORIGIN = "https://mcp.commercialdev.dev.veedna.com"
+
+
+def _usable_scan_refresh_token(raw: str) -> str:
+    """SCIM refresh token only — never a JWT, URL, or identity ``lineaje_pat_``."""
+    s = _normalize_token(raw)
+    if not s or s.startswith("http"):
         return ""
-    rows = [
-        f"| `{c['name']}` | {c['type']} | {c.get('framework') or '—'} | `{c.get('source_file') or '—'}` |"
-        for c in sorted(components, key=lambda x: (x["type"], x["name"]))
+    if s.count(".") == 2 and s.startswith("eyJ"):
+        return ""
+    if s.startswith("lineaje_pat"):
+        return ""
+    return s
+
+
+def _ensure_refresh_token_in_validated_fixes(
+    validated_fixes: Dict[str, str],
+    refresh_token: str,
+    source_dir: str = "",
+) -> None:
+    """Write the GHA SCIM refresh token into customer ``guardrail.json``.
+
+    MCP often has only the access JWT (already exchanged) and cannot store a
+    usable ``refreshtoken``. Identity PATs are not stored — runtime stubs
+    exchange this token at SCIM renew-access-token.
+    """
+    rel = _GUARDRAIL_MANIFEST_REL
+    rt = _usable_scan_refresh_token(refresh_token)
+    try:
+        data = json.loads(validated_fixes.get(rel, "") or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    existing = str(data.get("refreshtoken") or data.get("refresh_token") or "").strip()
+    keep = _usable_scan_refresh_token(existing)
+    token = keep or rt
+    if not token:
+        logger.warning(
+            "No SCIM refresh token for %s — set --lineaje-pat / LINEAJE_PAT_TOKEN "
+            "(do not store a JWT or lineaje_pat_ identity PAT)",
+            rel,
+        )
+        return
+    data.setdefault("contract_version", "2.0")
+    base = str(data.get("gr_service_url") or "").strip().rstrip("/") or _HARDCODED_GR_ORIGIN
+    data["gr_service_url"] = base
+    data["enforce_endpoint"] = f"{base}/enforce"
+    data["refreshtoken"] = token
+    data.pop("refresh_token", None)
+    data.setdefault("generated_by", "gha_repo_scan")
+    data["note"] = (
+        "Runtime guardrail stubs read refreshtoken from this file, exchange it "
+        "at SCIM renew-access-token for a short-lived Bearer, and POST /enforce. "
+        "Env GR_SERVICE_URL / LINEAJE_REFRESH_TOKEN / LINEAJE_PAT_TOKEN override "
+        "the manifest when set."
+    )
+    updated = json.dumps(data, indent=2) + "\n"
+    validated_fixes[rel] = updated
+    if source_dir:
+        dest = os.path.join(source_dir, rel)
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w", encoding="utf-8") as fh:
+                fh.write(updated)
+        except OSError as exc:
+            logger.warning("Could not write %s: %s", dest, exc)
+    logger.info("Customer %s refreshtoken=set (SCIM refresh token)", rel)
+
+
+# Extensions insertion_point_scanner.scan_file() actually scans. Passing the
+# full GHA file_list (lockfiles, markdown, images) is a no-op per file but
+# wastes runner time; restrict to these.
+_LOCAL_STUB_SCANNABLE_EXTS = frozenset({".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go"})
+_LOCAL_STUB_SKIP_BASENAMES = frozenset({
+    "gr_stub_client.py",
+    "gha_repo_scan.py",
+    "gha_repo_scan_fix.py",
+    "gha_stub_insertion.py",
+    "lineaje_ai_scan.py",
+    "insertion_point_scanner.py",
+    "scan_common.py",
+})
+_LOCAL_STUB_MAX_FILES = 200
+
+
+def _sibling_insertion_point_scanner_path() -> str:
+    """Path of a co-deployed scanner sitting next to this script, if any."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "insertion_point_scanner.py")
+
+
+def _ensure_insertion_point_scanner_on_path() -> bool:
+    """Return True only when ``insertion_point_scanner.py`` is next to this file.
+
+    Never adds the aipo_mcp_server repo root (or any other parent) to
+    ``sys.path`` — this script must stay standalone on a GHA runner that
+    ships only ``gha_repo_scan.py``.
+    """
+    scanner = _sibling_insertion_point_scanner_path()
+    if not os.path.isfile(scanner):
+        return False
+    here = os.path.dirname(scanner)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    return True
+
+
+def _rel_candidate_file(file_path: str, source_dir: str) -> str:
+    path = (file_path or "").strip().replace("\\", "/")
+    if not path:
+        return ""
+    src = os.path.realpath(source_dir)
+    abs_path = path if os.path.isabs(path) else os.path.normpath(os.path.join(src, path))
+    try:
+        rel = os.path.relpath(os.path.realpath(abs_path), src)
+    except ValueError:
+        return os.path.basename(path).replace("\\", "/")
+    if rel.startswith(".."):
+        return os.path.basename(path).replace("\\", "/")
+    return rel.replace("\\", "/")
+
+
+def _scannable_files_for_local_stubs(
+    violations: List[Dict[str, Any]],
+    file_list: List[str],
+    source_dir: str,
+) -> List[str]:
+    """Prefer files named in violations; otherwise every scannable path in file_list."""
+    listed = {(f or "").replace("\\", "/") for f in file_list}
+    from_violations: List[str] = []
+    seen: set = set()
+    for v in violations or []:
+        rel = _rel_candidate_file(v.get("file") or "", source_dir)
+        if (
+            rel
+            and rel in listed
+            and pathlib.Path(rel).suffix.lower() in _LOCAL_STUB_SCANNABLE_EXTS
+            and pathlib.Path(rel).name.lower() not in _LOCAL_STUB_SKIP_BASENAMES
+            and rel not in seen
+        ):
+            seen.add(rel)
+            from_violations.append(rel)
+    if from_violations:
+        return from_violations
+    return [
+        f.replace("\\", "/")
+        for f in file_list
+        if pathlib.Path(f).suffix.lower() in _LOCAL_STUB_SCANNABLE_EXTS
+        and pathlib.Path(f).name.lower() not in _LOCAL_STUB_SKIP_BASENAMES
     ]
-    return _COMPONENTS_SECTION_TEMPLATE.format(
-        count=len(components),
-        rows="\n".join(rows),
+
+
+def local_stub_insertions_from_checkout(
+    source_dir: str,
+    file_list: List[str],
+    violations: List[Dict[str, Any]],
+    *,
+    lineaje_pat: str = "",
+) -> Tuple[Dict[str, str], List[str], List[Dict[str, str]]]:
+    """Scan the GHA checkout with insertion_point_scanner and apply stubs.
+
+    Replaces the old ``gha_stub_insertion`` import, which required this
+    repo's full ``pipeline/stub`` package — never present on a customer
+    runner. Returns the same ``(validated_fixes, failed, fix_table)`` shape
+    ``_execute_scan`` uses for the MCP-provided stub_insertions path.
+    """
+    if not _ensure_insertion_point_scanner_on_path():
+        raise ModuleNotFoundError(
+            "insertion_point_scanner.py is not co-deployed next to this script"
+        )
+    from insertion_point_scanner import scan_project as _scan_project_local
+    from insertion_point_scanner import _import_hint as _local_import_hint
+
+    targets = _scannable_files_for_local_stubs(violations, file_list, source_dir)
+    if not targets:
+        logger.info("Local insertion-point scan: no scannable files in checkout")
+        return {}, [], []
+    if len(targets) > _LOCAL_STUB_MAX_FILES:
+        logger.warning(
+            "Local insertion-point scan: capping %d scannable file(s) to %d",
+            len(targets), _LOCAL_STUB_MAX_FILES,
+        )
+        targets = targets[:_LOCAL_STUB_MAX_FILES]
+
+    candidates, _mw = _scan_project_local(
+        project_root=source_dir,
+        files_to_scan=targets,
+        lineaje_pat=lineaje_pat or "",
+        max_files=max(len(targets), 1),
+    )
+    stub_insertions: List[Dict[str, Any]] = []
+    for c in candidates:
+        rel = _rel_candidate_file(c.file, source_dir)
+        stub_insertions.append({
+            "file": rel,
+            "line": c.line,
+            "status": "detected",
+            "proposed_stub": c.proposed_stub,
+            "insert_after": c.insert_after,
+            "safe_to_insert": c.safe_to_insert,
+            "skip_reason": c.skip_reason,
+            "description": c.description,
+            "import_needed": _local_import_hint(os.path.splitext(rel)[1]),
+        })
+    validated, failed = apply_stub_insertions_to_clone(stub_insertions, source_dir)
+    fix_table = [
+        {
+            "policy": "guardrail_stub",
+            "description": (s.get("description") or "")[:200],
+            "file": s.get("file", ""),
+        }
+        for s in stub_insertions
+        if s.get("status") == "detected" and (s.get("file") or "") in validated
+    ]
+    logger.info(
+        "Local insertion-point scan: %d candidate(s) found, %d file(s) applied",
+        len(candidates), len(validated),
+    )
+    return validated, failed, fix_table
+
+
+def try_local_stub_insertions_from_checkout(
+    source_dir: str,
+    file_list: List[str],
+    violations: List[Dict[str, Any]],
+    *,
+    lineaje_pat: str = "",
+) -> Tuple[Dict[str, str], List[str], List[Dict[str, str]], Optional[str]]:
+    """Fail-open wrapper: a missing scanner is a silent skip, not a scan error."""
+    if not _ensure_insertion_point_scanner_on_path():
+        logger.info(
+            "Skipping local stub fallback — insertion_point_scanner.py is not "
+            "next to this script (standalone GHA deploy)"
+        )
+        return {}, [], [], None
+    try:
+        validated, failed, table = local_stub_insertions_from_checkout(
+            source_dir, file_list, violations, lineaje_pat=lineaje_pat,
+        )
+        return validated, failed, table, None
+    except Exception as exc:
+        logger.warning("Local stub insertion failed: %s", exc)
+        return {}, [], [], None
+
+
+# ===========================================================================
+# Parallel batch scan
+# ===========================================================================
+
+def parallel_batch_scan(
+    batches: List[List[str]],
+    source_dir: str,
+    temp_dir: str,
+    source_code_repo: str,
+    branch: str,
+    head_sha: str,
+    run_id: str,
+    server_url: str,
+    bearer_getter: Callable[[], str],
+    manifest_files: Optional[List[str]] = None,
+    max_workers: int = MAX_SCAN_WORKERS,
+) -> Tuple[List[Dict[str, Any]], List[str], List[Dict[str, str]], int, List[str], str, List[Dict[str, Any]]]:
+    all_violations: List[Dict[str, Any]] = []
+    all_reports: List[str] = []
+    all_aibom: List[Dict[str, str]] = []
+    aibom_seen: set = set()
+    failed_batch_count = 0
+    failure_details: List[str] = []
+    enforce_service_url = ""
+    all_stub_insertions: List[Dict[str, Any]] = []
+    lock = threading.Lock()
+
+    def _scan_one(batch_idx: int, batch_files: List[str]) -> Tuple[int, Dict[str, Any]]:
+        logger.info("Batch %d/%d: %d files", batch_idx, len(batches), len(batch_files))
+        archive_path = create_batch_archive(
+            source_dir, temp_dir, batch_files,
+            source_code_repo, branch, head_sha, batch_idx, run_id=run_id,
+            manifest_files=manifest_files,
+        )
+        result = run_mcp_scan(
+            server_url, bearer_getter, source_code_repo, branch, batch_files, archive_path, head_sha=head_sha,
+        )
+        return batch_idx, result
+
+    def _collect(batch_idx: int, mcp_result: Dict[str, Any]) -> None:
+        nonlocal enforce_service_url
+        err = (mcp_result.get("error") or "").strip()
+        if mcp_result.get("success") is False or err:
+            raise RuntimeError(err or f"analyze_uploaded_archive failed: {mcp_result}")
+        batch_violations = list(mcp_result.get("violations") or [])
+        # Older servers emptied remediations and did not yet return violations —
+        # keep a file-only fallback so we can still insert stubs.
+        if not batch_violations:
+            batch_violations = [
+                {k: v for k, v in a.items() if k != "fix_code"}
+                for a in (mcp_result.get("remediation_actions") or [])
+                if a.get("file")
+            ]
+        batch_report = mcp_result.get("report", "")
+        batch_aibom = mcp_result.get("aibom", [])
+        batch_enforce = (mcp_result.get("enforce_service_url") or "").strip()
+        batch_stub_insertions = _stub_insertions_from_mcp_result(mcp_result)
+        logger.info(
+            "Batch %d/%d done: status=%s violations=%d aibom=%d enforce=%s stub_insertions=%d",
+            batch_idx, len(batches), mcp_result.get("status", "unknown"),
+            len(batch_violations), len(batch_aibom),
+            batch_enforce or "(none)", len(batch_stub_insertions),
+        )
+        with lock:
+            all_violations.extend(batch_violations)
+            if batch_enforce:
+                enforce_service_url = batch_enforce
+            if batch_report:
+                all_reports.append(batch_report)
+            for entry in batch_aibom:
+                key = (entry.get("name", ""), entry.get("source_file", ""))
+                if key not in aibom_seen:
+                    aibom_seen.add(key)
+                    all_aibom.append(entry)
+            all_stub_insertions.extend(batch_stub_insertions)
+
+    def _run_and_collect(batch_idx: int, batch_files: List[str]) -> None:
+        try:
+            _, mcp_result = _scan_one(batch_idx, batch_files)
+            _collect(batch_idx, mcp_result)
+        except BaseException as exc:
+            nonlocal failed_batch_count
+            failed_batch_count += 1
+            # Unwrap ExceptionGroup / TaskGroup to surface the real cause
+            cause = exc
+            if hasattr(exc, "exceptions") and exc.exceptions:
+                cause = exc.exceptions[0]
+                if hasattr(cause, "exceptions") and cause.exceptions:
+                    cause = cause.exceptions[0]
+            detail = f"Batch {batch_idx}/{len(batches)} failed: {type(cause).__name__}: {cause}"
+            logger.error("%s", detail)
+            logger.debug("Full exception:", exc_info=exc)
+            failure_details.append(detail)
+
+    if not batches:
+        return all_violations, all_reports, all_aibom, failed_batch_count, failure_details, enforce_service_url, all_stub_insertions
+
+    # Batch 1 runs alone, first — every batch's get_upload_url call resolves
+    # (or creates) the SCIM project for this repo+branch+commit via
+    # get_sbom_id server-side, with no idempotency guarantee across
+    # concurrent callers (see mcp_server.py's own comment on this race).
+    # Running batches 2..N concurrently with batch 1 means N racing
+    # "does this project exist yet?" checks, each seeing "no" and each
+    # POSTing a create — duplicate project rows for one repo+branch+commit.
+    # Scanning batch 1 to completion first means the project already exists
+    # by the time the rest start, so they resolve (not create) it instead.
+    logger.info("Batch 1/%d runs first (alone) so the SCIM project exists before the rest scan in parallel", len(batches))
+    _run_and_collect(1, batches[0])
+
+    remaining = list(enumerate(batches[1:], 2))
+    if remaining:
+        workers = min(len(remaining), max_workers)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_run_and_collect, idx, files) for idx, files in remaining]
+            for future in as_completed(futures):
+                future.result()  # _run_and_collect already caught/recorded its own failure
+
+    return all_violations, all_reports, all_aibom, failed_batch_count, failure_details, enforce_service_url, all_stub_insertions
+
+# ===========================================================================
+# JSON output
+# ===========================================================================
+
+# Human report must not include stub-insertion write-ups (PR body or report.json).
+_STUB_REPORT_HEADINGS = (
+    "## UniFAI Guardrail Stub Insertion",
+    "## Guardrail Stub Insertions",
+    "## SECTION 2: Guardrail Stub Coverage",
+)
+
+
+def _strip_stub_insertion_markdown(report: str) -> str:
+    """Drop stub-insertion sections from the policy report markdown."""
+    if not report:
+        return ""
+    parts = re.split(r"(?=^## )", report, flags=re.MULTILINE)
+    kept: List[str] = []
+    for part in parts:
+        if any(part.startswith(h) for h in _STUB_REPORT_HEADINGS):
+            continue
+        kept.append(part)
+    text = "".join(kept)
+    text = re.sub(r"\n---\s*(?=\n*$)", "\n", text)
+    text = re.sub(r"\n---\s*\n+(?=\n## |\n### |\Z)", "\n\n", text)
+    return text.strip() + ("\n" if text.strip() else "")
+
+
+def build_json_output(
+    *,
+    status: str,
+    repo: str,
+    branch: str,
+    head_sha: str,
+    source_code_repo: str,
+    files_scanned: int,
+    batches: int,
+    failed_batches: int,
+    violations: List[Dict[str, Any]],
+    aibom: Optional[List[Dict[str, str]]] = None,
+    report: str = "",
+    remediation_pr: Optional[int] = None,
+    remediation_branch: str = "",
+    failed_remediation_files: Optional[List[str]] = None,
+    scan_errors: Optional[List[str]] = None,
+    enforce_service_url: str = "",
+) -> Dict[str, Any]:
+    return {
+        "status": status,
+        "scan_metadata": {
+            "repo": repo,
+            "branch": branch,
+            "head_sha": head_sha,
+            "source_code_repo": source_code_repo,
+            "scanned_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "files_scanned": files_scanned,
+            "batches": batches,
+            "failed_batches": failed_batches,
+        },
+        "report": _strip_stub_insertion_markdown(report),
+        "violations": violations,
+        "aibom": aibom or [],
+        "enforce_service_url": enforce_service_url,
+        "remediation_pr": remediation_pr,
+        "remediation_branch": remediation_branch,
+        "failed_remediation_files": failed_remediation_files or [],
+        "scan_errors": scan_errors or [],
+    }
+
+
+def _violation_line_display(v: Dict[str, Any]) -> str:
+    """1-indexed source line(s) for a finding, or em-dash when unknown."""
+    nums: List[int] = []
+    seen: set = set()
+
+    def _add(raw: Any) -> None:
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return
+        if n > 0 and n not in seen:
+            seen.add(n)
+            nums.append(n)
+
+    vcs = v.get("violating_code")
+    if isinstance(vcs, list):
+        for vc in vcs:
+            if isinstance(vc, dict):
+                _add(vc.get("line"))
+            else:
+                _add(getattr(vc, "line", 0))
+    meta = v.get("metadata") if isinstance(v.get("metadata"), dict) else {}
+    _add(v.get("line"))
+    _add(v.get("line_number"))
+    _add(meta.get("line_number"))
+    if not nums:
+        return "—"
+    return ", ".join(str(n) for n in nums)
+
+
+def _violation_file_line_and_control(v: Dict[str, Any]) -> Tuple[str, str, str]:
+    vcs = v.get("violating_code") or []
+    first_vc = vcs[0] if vcs and isinstance(vcs[0], dict) else {}
+    file_ = v.get("file") or first_vc.get("filename") or "(unknown)"
+    control = v.get("policy_name") or v.get("control") or v.get("policy_id") or "(unknown)"
+    return str(file_), _violation_line_display(v), str(control)
+
+
+def format_violations_markdown_table(
+    violations: List[Dict[str, Any]],
+    *,
+    max_files: int = 0,
+) -> str:
+    """GitHub-flavored Markdown table: File | Line | Policy (one row per finding)."""
+    rows: List[Tuple[str, str, str]] = []
+    files: set = set()
+    for v in violations:
+        file_, line, control = _violation_file_line_and_control(v)
+        files.add(file_)
+        rows.append((file_, line, control))
+    if not rows:
+        return ""
+
+    def _line_sort_key(line: str) -> int:
+        if not line or line == "—":
+            return 0
+        try:
+            return int(str(line).split(",", 1)[0].strip())
+        except ValueError:
+            return 0
+
+    rows.sort(key=lambda r: (r[0], _line_sort_key(r[1]), r[2]))
+    extra = 0
+    if max_files and len(rows) > max_files:
+        extra = len(rows) - max_files
+        rows = rows[:max_files]
+    lines = [
+        f"**{len(violations)} violation(s) across {len(files)} file(s)**",
+        "",
+        "| File | Line | Policy |",
+        "|------|------|--------|",
+    ]
+    for file_, line, control in rows:
+        lines.append(f"| `{file_}` | {line} | {control} |")
+    if extra:
+        lines.append(f"| _…and {extra} more violation(s)_ | — | _see full scan report_ |")
+    return "\n".join(lines)
+
+
+def _extract_markdown_section(report: str, heading_substr: str) -> str:
+    """Return the ``### …`` section whose heading contains *heading_substr*."""
+    if not report or not heading_substr:
+        return ""
+    lines = report.splitlines()
+    start: Optional[int] = None
+    for i, line in enumerate(lines):
+        if line.startswith("### ") and heading_substr in line:
+            start = i
+            break
+    if start is None:
+        return ""
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("### "):
+            end = j
+            break
+    return "\n".join(lines[start:end]).strip()
+
+
+def _clip_github_report(report: str, max_chars: int = 40_000) -> str:
+    """Trim a markdown chunk to *max_chars*; close dangling fences."""
+    text = (report or "").strip()
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        clipped = text
+        truncated = False
+    else:
+        budget = max(0, max_chars - len(_PR_BODY_TRUNCATION_NOTE))
+        clipped = text[:budget]
+        truncated = True
+    if clipped.count("```") % 2 == 1:
+        clipped += "\n```\n"
+    if truncated:
+        clipped += _PR_BODY_TRUNCATION_NOTE
+    return clipped
+
+
+def _fit_github_pr_body(text: str, max_chars: int = GITHUB_PR_BODY_SAFE_LIMIT) -> str:
+    """Hard-cap a PR body so GitHub's 65536-char POST /pulls does not 422."""
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    note = _PR_BODY_TRUNCATION_NOTE
+    fence = "\n```\n"
+    budget = max(0, max_chars - len(note))
+    clipped = text[:budget]
+    if clipped.count("```") % 2 == 1:
+        budget = max(0, max_chars - len(note) - len(fence))
+        clipped = text[:budget] + fence
+    return clipped + note
+
+
+def _build_fix_pr_body(
+    *,
+    branch: str,
+    sha_short: str,
+    report: str = "",
+    violations: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """PR description: UnifAI report first, full scan report folded. Stub files are
+    on the branch itself — they are not listed in this body."""
+    violations = violations or []
+    report = _strip_stub_insertion_markdown(report)
+    if "## No Files Changed" in (report or ""):
+        report = ""
+    report_says_violations = "violations_found" in (report or "")
+    status_label = "❌ Not Compliant" if (violations or report_says_violations) else "✅ Compliant"
+    lines: List[str] = [
+        "# UnifAI Security Report",
+        "",
+        f"**Status:** {status_label}",
+        f"**Branch:** `{branch}`",
+        f"**Commit:** `{sha_short}`",
+        "",
+    ]
+    vtable = format_violations_markdown_table(violations, max_files=40)
+    if vtable:
+        lines += [vtable, ""]
+    elif not violations and not report_says_violations:
+        lines += ["No violations found.", ""]
+
+    prefix_len = len("\n".join(lines))
+    remaining = GITHUB_PR_BODY_SAFE_LIMIT - prefix_len - 400
+
+    policy_section = _extract_markdown_section(report, "SECTION 2: Policy Violations")
+    if policy_section and remaining > 500:
+        section_budget = min(8_000, max(500, remaining // 4))
+        lines += ["---", "", _clip_github_report(policy_section, max_chars=section_budget), ""]
+        remaining -= section_budget
+
+    if report and report.strip() and remaining > 500:
+        lines += [
+            "---",
+            "",
+            "<details>",
+            "<summary><strong>Full scan report</strong></summary>",
+            "",
+            _clip_github_report(report, max_chars=remaining),
+            "",
+            "</details>",
+        ]
+    return _fit_github_pr_body("\n".join(lines))
+
+
+def print_human_output(output: Dict[str, Any]) -> None:
+    status = output.get("status", "unknown")
+    violations = output.get("violations", [])
+    scan_errors = output.get("scan_errors", [])
+    metadata = output.get("scan_metadata", {})
+    scanned_at = metadata.get("scanned_at", "")
+    branch = metadata.get("branch", "")
+    repo = metadata.get("repo") or ""
+    rem_pr = output.get("remediation_pr")
+
+    if status == "compliant":
+        status_label = "✅ Compliant"
+    elif status == "violations_found":
+        status_label = "❌ Not Compliant"
+    else:
+        status_label = status
+
+    print("# UnifAI Security Report")
+    print()
+    print(f"**Status:** {status_label}")
+    if branch:
+        print(f"**Branch:** `{branch}`")
+    if scanned_at:
+        print(f"**Scanned at:** {scanned_at}")
+    if rem_pr:
+        print(f"**Remediation PR:** https://github.com/{repo}/pull/{rem_pr}")
+
+    if scan_errors:
+        print("\n**Errors:**")
+        for err in scan_errors:
+            print(f"- {err}")
+        print()
+
+    if not violations:
+        if status == "compliant":
+            print("\nNo violations found.")
+        return
+
+    print()
+    print(format_violations_markdown_table(violations, max_files=40))
+
+
+# ===========================================================================
+# Patch application (ported from veracode_repo_scan.py, no external deps)
+# ===========================================================================
+
+def _normalize_for_patch_match(s: str) -> str:
+    return re.sub(r"[ \t]+", " ", s)
+
+
+def _apply_fix_entry(content: str, original: str, replacement: str) -> Tuple[str, bool]:
+    if not original:
+        return content, False
+
+    if original in content:
+        return content.replace(original, replacement, 1), True
+
+    orig_stripped = original.strip()
+    if orig_stripped and orig_stripped in content:
+        return content.replace(orig_stripped, replacement, 1), True
+
+    norm_orig = _normalize_for_patch_match(orig_stripped)
+    norm_content = _normalize_for_patch_match(content)
+    idx = norm_content.find(norm_orig)
+    if idx != -1:
+        orig_len = len(orig_stripped)
+        real_idx = 0
+        norm_walked = 0
+        for ci, ch in enumerate(content):
+            if norm_walked >= idx:
+                real_idx = ci
+                break
+            norm_walked += len(_normalize_for_patch_match(ch))
+        else:
+            real_idx = len(content)
+        sub = content[real_idx: real_idx + orig_len + 50]
+        if orig_stripped in sub:
+            actual_idx = content.find(orig_stripped, real_idx)
+            if actual_idx != -1:
+                return content[:actual_idx] + replacement + content[actual_idx + len(orig_stripped):], True
+
+    orig_lines = [l for l in orig_stripped.splitlines() if l.strip()]
+    if orig_lines:
+        anchor = orig_lines[0].strip()
+        if len(anchor) > 15:
+            anchor_idx = content.find(anchor)
+            if anchor_idx != -1:
+                end_search = content.find(orig_lines[-1].strip(), anchor_idx) if len(orig_lines) > 1 else anchor_idx
+                if end_search != -1:
+                    end_idx = end_search + len(orig_lines[-1].strip())
+                    found_block = content[anchor_idx:end_idx]
+                    if len(found_block) < len(orig_stripped) * 2:
+                        return content[:anchor_idx] + replacement + content[end_idx:], True
+
+    return content, False
+
+
+def _norm_rel_path(p: str) -> str:
+    s = p.strip().replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return s
+
+
+def _resolve_source_file(source_dir: str, filepath: str, file_list: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve a violation filepath to (rel_path, content) from the live checkout."""
+    raw = filepath.strip()
+    if not raw:
+        return None, None
+    norm_fp = _norm_rel_path(raw)
+    root = pathlib.Path(source_dir)
+
+    candidate = root / raw
+    if candidate.is_file():
+        return norm_fp, candidate.read_text(errors="replace")
+
+    # Try normalised path
+    candidate2 = root / norm_fp
+    if candidate2.is_file():
+        return norm_fp, candidate2.read_text(errors="replace")
+
+    # Basename fallback
+    base = pathlib.Path(norm_fp).name
+    matches = [f for f in file_list if pathlib.Path(f).name == base]
+    if len(matches) == 1:
+        full = root / matches[0]
+        if full.is_file():
+            return _norm_rel_path(matches[0]), full.read_text(errors="replace")
+
+    logger.warning("Cannot resolve remediation file %r in source dir", raw)
+    return None, None
+
+
+def apply_pipeline_fix_code_to_clone(
+    remediation_actions: List[Dict[str, Any]],
+    source_dir: str,
+    file_list: List[str],
+) -> Tuple[Dict[str, str], List[str], List[Dict[str, str]]]:
+    """Apply fix_code patches from MCP remediation_actions to checked-out files.
+
+    Returns (validated_fixes, failed_files, fix_table_rows).
+    """
+    validated_fixes: Dict[str, str] = {}
+    failed_files: List[str] = []
+    fix_table_rows: List[Dict[str, str]] = []
+
+    by_file: Dict[str, List[Dict[str, Any]]] = {}
+    for action in remediation_actions:
+        fp = (action.get("file") or "").strip()
+        if fp:
+            by_file.setdefault(fp, []).append(action)
+
+    for filepath, actions in by_file.items():
+        has_fix_code = any(action.get("fix_code") for action in actions)
+        if not has_fix_code:
+            failed_files.append(filepath)
+            continue
+
+        rel_path, original_content = _resolve_source_file(source_dir, filepath, file_list)
+        if rel_path is None or original_content is None:
+            failed_files.append(filepath)
+            continue
+
+        content = original_content
+        patch_applied = False
+        for action in actions:
+            for fix_entry in (action.get("fix_code") or []):
+                original = fix_entry.get("original") or ""
+                replacement = fix_entry.get("replacement", "")
+                if not original.strip():
+                    continue
+                content, applied = _apply_fix_entry(content, original, replacement)
+                if applied:
+                    patch_applied = True
+                else:
+                    logger.debug(
+                        "Patch not applied for %r — original snippet (%d chars) not found",
+                        filepath, len(original),
+                    )
+
+        if patch_applied and content != original_content:
+            validated_fixes[rel_path] = content
+            for action in actions:
+                fix_table_rows.append({
+                    "policy": action.get("control", ""),
+                    "description": (action.get("instruction") or "")[:200],
+                    "file": filepath,
+                })
+        else:
+            logger.warning("No patch applied for %r — snippets did not match file content", filepath)
+            failed_files.append(filepath)
+
+    return validated_fixes, failed_files, fix_table_rows
+
+
+# ===========================================================================
+# Remediation PR creation
+# ===========================================================================
+
+class _GhaGitHubClient:
+    """Minimal GitHub REST client for the standalone GHA scanner.
+
+    This script is copied alone into ``.lineaje-scanner/scripts/`` — it must
+    not import ``scm_client.py``.
+    """
+
+    def __init__(self, token: str, base_url: str = "") -> None:
+        self.token = token
+        self.base_url = (
+            base_url
+            or os.environ.get("GITHUB_API_URL")
+            or "https://api.github.com"
+        ).rstrip("/")
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: Optional[Dict[str, Any]] = None,
+        *,
+        expected_errors: Optional[set] = None,
+    ) -> Any:
+        url = f"{self.base_url}{path}" if path.startswith("/") else path
+        headers = {
+            "Authorization": f"token {self.token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "UniFAI-GHA-Scanner/1.0",
+        }
+        data = json.dumps(body).encode() if body else None
+        if data:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as exc:
+            err = exc.read().decode("utf-8", errors="replace")[:500]
+            if expected_errors and exc.code in expected_errors:
+                logger.debug("GitHub API %s %s → %s (expected): %s", method, url, exc.code, err)
+            else:
+                logger.error("GitHub API %s %s → %s: %s", method, url, exc.code, err)
+            raise
+
+    def create_branch(self, repo: str, branch_name: str, from_sha: str) -> None:
+        self._request("POST", f"/repos/{repo}/git/refs", {
+            "ref": f"refs/heads/{branch_name}",
+            "sha": from_sha,
+        })
+
+    def get_file_blob_sha(self, repo: str, path: str, ref: str) -> Optional[str]:
+        encoded_path = urllib.parse.quote(path, safe="/")
+        qref = urllib.parse.quote(ref, safe="")
+        try:
+            data = self._request(
+                "GET",
+                f"/repos/{repo}/contents/{encoded_path}?ref={qref}",
+                expected_errors={404},
+            )
+            if isinstance(data, dict) and data.get("type") == "file" and data.get("sha"):
+                return str(data["sha"])
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise
+        return None
+
+    def commit_file(
+        self,
+        repo: str,
+        branch: str,
+        path: str,
+        content: bytes,
+        message: str,
+        sha: Optional[str] = None,
+    ) -> str:
+        if sha is None:
+            sha = self.get_file_blob_sha(repo, path, branch)
+        payload: Dict[str, Any] = {
+            "message": message,
+            "content": base64.b64encode(content).decode(),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+        encoded_path = urllib.parse.quote(path, safe="/")
+        resp = self._request("PUT", f"/repos/{repo}/contents/{encoded_path}", payload)
+        return resp["commit"]["sha"]
+
+    def create_pull_request(
+        self,
+        repo: str,
+        title: str,
+        head: str,
+        base: str,
+        body: str,
+        **_kw: Any,
+    ) -> int:
+        resp = self._request("POST", f"/repos/{repo}/pulls", {
+            "title": title,
+            "head": head,
+            "base": base,
+            "body": body,
+        })
+        return resp["number"]
+
+
+def _create_fix_pr(
+    github_token: str,
+    repo: str,
+    branch: str,
+    head_sha: str,
+    validated_fixes: Dict[str, str],
+    fix_table: List[Dict[str, str]],
+    *,
+    report: str = "",
+    failed_files: Optional[List[str]] = None,
+    violations: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Optional[int], str, str]:
+    """Commit stub + enforce-API files to a branch and open a PR.
+
+    Returns ``(pr_number_or_None, remediation_branch, error_or_empty)``.
+    """
+    if not validated_fixes:
+        return None, "", ""
+
+    if not head_sha:
+        logger.error(
+            "Cannot create remediation branch: head_sha is empty. "
+            "Pass --head-sha or ensure $GITHUB_SHA is set in the environment."
+        )
+        return None, "", "Cannot create remediation branch: head_sha is empty"
+
+    safe_branch = re.sub(r"[^a-zA-Z0-9._/-]", "-", branch)
+    sha_short = head_sha[:7]
+    timestamp = time.strftime("%m%d%H%M")
+    remediation_branch = f"{REMEDIATION_BRANCH_PREFIX}-{safe_branch.replace('/', '-')}-{sha_short}-{timestamp}"
+
+    scm = _GhaGitHubClient(token=github_token)
+
+    # Resolve short SHA to full 40-char SHA (GitHub's /git/refs API requires it)
+    if len(head_sha) < 40:
+        try:
+            commit_data = scm._request("GET", f"/repos/{repo}/commits/{head_sha}")
+            head_sha = commit_data["sha"]
+        except Exception as exc:
+            logger.warning("Could not resolve short SHA %s: %s", head_sha, exc)
+
+    try:
+        logger.info("Creating remediation branch %s from %s", remediation_branch, sha_short)
+        scm.create_branch(repo, remediation_branch, head_sha)
+    except Exception as exc:
+        logger.error("Failed to create/verify remediation branch: %s", exc)
+        return None, remediation_branch, f"Failed to create remediation branch: {exc}"
+
+    committed: List[str] = []
+    for filepath, content in validated_fixes.items():
+        blob_sha: Optional[str] = None
+        try:
+            blob_sha = scm.get_file_blob_sha(repo, filepath, head_sha)
+        except Exception:
+            pass
+        policies = ", ".join({r["policy"] for r in fix_table if r["file"] == filepath}) or "policy violations"
+        message = f"fix({filepath}): remediate {policies} [unifai-gha-scan]"
+        try:
+            scm.commit_file(repo, remediation_branch, filepath, content.encode("utf-8"), message, sha=blob_sha)
+            committed.append(filepath)
+            logger.info("Committed fix: %s", filepath)
+        except Exception as exc:
+            logger.error("Failed to commit %s: %s", filepath, exc)
+
+    if not committed:
+        logger.warning("No files committed — skipping PR creation")
+        return None, remediation_branch, "No files committed — skipping PR creation"
+
+    title = f"[unifai-bot] chore: insert guardrail stubs for {branch}@{sha_short}"
+    pr_body = _build_fix_pr_body(
+        branch=branch,
+        sha_short=sha_short,
+        report=report,
+        violations=violations,
+    )
+    logger.info(
+        "PR body: %d chars, report=%s, violations=%d",
+        len(pr_body), "yes" if (report or "").strip() else "no", len(violations or []),
     )
 
-
-# ── Component discovery + upload ──────────────────────────────────────────────
-
-def _discover_components(clone_dir: str) -> tuple[list[dict], Any]:
-    """Run Pass 1 static analysis on the cloned repo. Returns (component_list, graph)."""
     try:
-        from pipeline.discovery.discovery import run_static_analysis
-        _skip_dirs = {"node_modules", ".git", "__pycache__", "venv", ".venv",
-                      "dist", "build", ".tox", ".mypy_cache"}
-        _scan_exts = {".py", ".js", ".ts", ".jsx", ".tsx", ".java"}
-        _root = Path(clone_dir)
-        _file_tuples: list[tuple[str, str]] = []
-        for _p in _root.rglob("*"):
-            if any(part in _skip_dirs for part in _p.parts):
-                continue
-            if _p.is_file() and _p.suffix.lower() in _scan_exts:
-                try:
-                    _rel = str(_p.relative_to(_root))
-                    _file_tuples.append((_rel, _p.read_text(encoding="utf-8", errors="replace")))
-                except Exception:
-                    pass
-            if len(_file_tuples) >= 200:
-                break
-
-        if not _file_tuples:
-            return [], None
-
-        _, graph = run_static_analysis(_file_tuples)
-        _type_to_doc_type = {
-            "model": "aimodel", "agent": "aiagent",
-            "mcp_server": "mcpserver", "mcp_client": "mcpserver",
-            "rag": "rag", "package": "package",
-            "skill": "skill", "agent_config": "agent_config",
-        }
-        components = [
-            {
-                "name": c.name,
-                "type": c.component_type.value,
-                "doc_type": _type_to_doc_type.get(c.component_type.value, c.component_type.value),
-                "version": c.version or "",
-                "framework": c.framework or "",
-                "source_file": c.file,
-            }
-            for c in graph.components
-        ]
-        return components, graph
+        pr_number = scm.create_pull_request(repo, title, remediation_branch, branch, pr_body)
+        logger.info("Created remediation PR #%d", pr_number)
+        return pr_number, remediation_branch, ""
     except Exception as exc:
-        _logger.warning("Component discovery skipped: %s", exc)
-        return [], None
-
-
-def _upload_components(graph, lineaje_pat: str) -> dict:
-    """Best-effort upload of the component graph to the Data Service."""
-    if not lineaje_pat or graph is None:
-        return {}
-    try:
-        from pipeline.service_integrations.entity_builder import build_aientity_json
-        from pipeline.service_integrations.tarball import (
-            TarballUploadContext, build_entity_s3_path, create_tarball,
+        logger.error("Failed to create remediation PR (%d chars): %s", len(pr_body), exc)
+        fallback = _build_fix_pr_body(
+            branch=branch,
+            sha_short=sha_short,
+            report="",
+            violations=[],
         )
-        from pipeline.service_integrations.scim_client import get_presigned_url, upload_to_s3
-        from pipeline.foundation.env_defaults import env_get
-        from config import DEFAULT_SCIM_SERVICE_URL, DEFAULT_S3_BUCKET
-        import uuid
-
-        scim_url = env_get("SCIM_SERVICE_URL", default=DEFAULT_SCIM_SERVICE_URL)
-        s3_bucket = env_get("S3_BUCKET", default=DEFAULT_S3_BUCKET)
-        ctx = TarballUploadContext(
-            bearer_token=lineaje_pat,
-            scim_service_url=scim_url,
-            s3_bucket_name=s3_bucket,
-            unique_id=str(uuid.uuid4()),
-        )
-        entity_json = build_aientity_json(graph, unique_id=ctx.unique_id)
-        if not entity_json:
-            return {"uploaded": False, "reason": "no_entities"}
-        tarball = create_tarball(entity_json, "entities.aientity.json")
         try:
-            s3_path = build_entity_s3_path(ctx)
-            presigned = get_presigned_url(scim_url, s3_bucket, s3_path, method="PUT", bearer_token=lineaje_pat)
-            if presigned:
-                upload_to_s3(tarball, presigned)
-                return {"uploaded": True, "s3_path": s3_path, "entity_count": len(entity_json)}
-            return {"uploaded": False, "reason": "no_presigned_url"}
-        finally:
-            try:
-                tarball.unlink(missing_ok=True)
-            except Exception:
-                pass
-    except Exception as exc:
-        _logger.warning("Component upload skipped: %s", exc)
-        return {"uploaded": False, "reason": str(exc)}
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description="UniFAI Guardrail Repo Scanner (CON-2014)")
-    ap.add_argument("--repo", help="owner/repo on the SCM provider")
-    ap.add_argument("--branch", default="main", help="Branch to scan (default: main)")
-    ap.add_argument("--local-path", help="Path to an already-cloned repo (skips clone)")
-    ap.add_argument("--tenant-id", default="", help="GR service tenant ID")
-    ap.add_argument("--company-id", default="", help="GR service company ID")
-    ap.add_argument("--provider", default="", help="SCM provider: github|bitbucket|gitlab")
-    ap.add_argument("--lineaje-pat", default="", help="Lineaje PAT (GR service auth + Data Service upload)")
-    ap.add_argument("--no-pr", action="store_true", help="Skip PR creation — report only")
-    ap.add_argument("--dry-run", action="store_true", help="Don't commit or open a PR")
-    args = ap.parse_args()
-
-    provider = (args.provider or os.environ.get("SCM_PROVIDER", "github")).lower()
-    token = os.environ.get("SCM_ACCESS_TOKEN", "")
-    tenant_id = args.tenant_id or os.environ.get("GR_TENANT_ID", "")
-    company_id = args.company_id or os.environ.get("GR_COMPANY_ID", "")
-    lineaje_pat = args.lineaje_pat or os.environ.get("LINEAJE_PAT", "")
-
-    if not args.local_path and not args.repo:
-        _logger.error("Provide --repo or --local-path")
-        return 2
-
-    if not args.local_path and not token:
-        _logger.error("SCM_ACCESS_TOKEN not set")
-        return 2
-
-    with tempfile.TemporaryDirectory(prefix="unifai-gr-repo-") as tmp:
-        if args.local_path:
-            clone_dir = args.local_path
-            head_sha = _git_head_sha(clone_dir) if not args.no_pr else "local"
-        else:
-            clone_dir = os.path.join(tmp, "repo")
-            try:
-                _git_clone(args.repo, args.branch, clone_dir, token, provider)
-            except subprocess.CalledProcessError as exc:
-                _logger.error("Clone failed: %s", exc.stderr.decode(errors="replace") if exc.stderr else exc)
-                return 1
-            head_sha = _git_head_sha(clone_dir)
-
-        # ── Guardrail stub scan ───────────────────────────────────────────────
-        _logger.info("Scanning %s for insertion points …", clone_dir)
-        # No policy_map passed — see guardrail_stub_insertion.py's matching
-        # comment: the only broad candidate-policy source available today
-        # (hardcoded_insertion_point_map()) maps ~49-52 near-identical policy
-        # IDs to almost every insertion_point, which would bloat every
-        # generated stub with a long, low-signal literal rather than a
-        # genuinely precise per-site candidate set.
-        candidates, _middleware_candidates = scan_project(project_root=clone_dir, lineaje_pat=lineaje_pat)
-
-        # scan_project always returns c.file as an ABSOLUTE path — normalize
-        # to repo-relative here (the single point every caller below routes
-        # through) since _apply_stubs / the SCM commit path both need a
-        # repo-relative path, not a local clone filesystem path.
-        for c in candidates:
-            if os.path.isabs(c.file):
-                c.file = os.path.relpath(c.file, clone_dir)
-
-        # Deduplicate
-        seen: set = set()
-        unique: list = []
-        for c in candidates:
-            key = (c.file, c.line)
-            if key not in seen:
-                seen.add(key)
-                unique.append(c)
-
-        # ── AI Component Discovery ────────────────────────────────────────────
-        _logger.info("Running AI component discovery …")
-        discovered_components, comp_graph = _discover_components(clone_dir)
-        _logger.info(
-            "Discovered %d AI component(s) (%s)",
-            len(discovered_components),
-            ", ".join(f"{c['name']} ({c['type']})" for c in discovered_components[:5])
-            or "none",
-        )
-
-        # Best-effort upload to Data Service
-        component_upload = _upload_components(comp_graph, lineaje_pat)
-        if component_upload.get("uploaded"):
-            _logger.info("Component inventory uploaded to %s", component_upload.get("s3_path"))
-
-        if not unique:
-            _logger.info("No unguarded insertion points found — nothing to do.")
-            print(json.dumps({
-                "status": "clean",
-                "violations": 0,
-                "discovered_components": discovered_components,
-                "component_upload": component_upload,
-            }))
-            return 0
-
-        files_hit = len({c.file for c in unique})
-        _logger.info("Found %d insertion point(s) across %d file(s)", len(unique), files_hit)
-
-        table = _make_table(unique)
-        print(f"\n{table}\n")
-
-        if args.no_pr or args.dry_run:
-            print(json.dumps({
-                "status": "violations_found",
-                "violations": len(unique),
-                "files": files_hit,
-                "discovered_components": discovered_components,
-                "component_upload": component_upload,
-            }))
-            return 0
-
-        # ── Apply stubs ───────────────────────────────────────────────────────
-        changed = _apply_stubs(unique, clone_dir)
-        if not changed:
-            _logger.warning("No files modified after stub application")
-            return 1
-
-        # ── Create branch + commit via SCM API ────────────────────────────────
-        scm = create_scm_client(provider, token=token)
-        stub_branch = f"{_STUB_BRANCH_PREFIX}-{head_sha}"
-
-        # Check if branch already exists
-        if scm.branch_exists(args.repo, stub_branch):
-            _logger.info("Branch %s already exists — will reuse", stub_branch)
-        else:
-            scm.create_branch(args.repo, stub_branch, from_sha=head_sha)
-            _logger.info("Created branch %s", stub_branch)
-
-        # Commit each changed file
-        committed: list[str] = []
-        failed: list[str] = []
-        for rel_path, new_content in changed.items():
-            try:
-                blob_sha = scm.get_file_blob_sha(args.repo, rel_path, stub_branch)
-                scm.commit_file(
-                    repo=args.repo,
-                    path=rel_path,
-                    content=new_content,
-                    branch=stub_branch,
-                    message=f"chore(guardrails): add guardrail_check stubs to {rel_path}",
-                    sha=blob_sha,
-                )
-                committed.append(rel_path)
-                _logger.info("Committed stubs for %s", rel_path)
-            except Exception as exc:
-                _logger.warning("Failed to commit %s: %s", rel_path, exc)
-                failed.append(rel_path)
-
-        if not committed:
-            _logger.error("No files committed — aborting PR creation")
-            return 1
-
-        # ── Open PR ───────────────────────────────────────────────────────────
-        components_section = _make_components_section(discovered_components)
-        pr_body = _BOT_PR_BODY_TEMPLATE.format(
-            marker=_COMMENT_MARKER,
-            count=len(unique),
-            files=files_hit,
-            table=table,
-            components_section=components_section,
-            tenant_id=tenant_id or "<set GR_TENANT_ID>",
-        )
-
-        existing_pr = scm.find_open_pr_by_prefix(
-            args.repo, head_prefix=_STUB_BRANCH_PREFIX, base=args.branch,
-        )
-        if existing_pr:
-            scm.update_pull_request_body(args.repo, existing_pr, body=pr_body)
-            pr_number = existing_pr
-            _logger.info("Updated existing PR #%d", pr_number)
-        else:
-            pr_number = scm.create_pull_request(
-                repo=args.repo,
-                head=stub_branch,
-                base=args.branch,
-                title=_PR_TITLE_TEMPLATE.format(count=len(unique)),
-                body=pr_body,
+            pr_number = scm.create_pull_request(repo, title, remediation_branch, branch, fallback)
+            logger.warning(
+                "Created remediation PR #%d with fallback body after: %s", pr_number, exc,
             )
-            _logger.info("Opened PR #%d", pr_number)
+            return pr_number, remediation_branch, ""
+        except Exception as exc2:
+            logger.error("Fallback PR creation also failed: %s", exc2)
+            return (
+                None,
+                remediation_branch,
+                f"Failed to create remediation PR for `{remediation_branch}`: {exc2}",
+            )
 
-        result = {
-            "status": "pr_opened",
-            "pr_number": pr_number,
-            "branch": stub_branch,
-            "violations": len(unique),
-            "files_modified": len(committed),
-            "files_failed": len(failed),
-            "discovered_components": discovered_components,
-            "component_upload": component_upload,
-        }
-        print(json.dumps(result, indent=2))
+
+# ===========================================================================
+# Main scan orchestration
+# ===========================================================================
+
+_SELF_SCAN_REPO_SLUGS = frozenset({"aipo-mcp-server"})
+
+
+def _is_self_scan_target(source_code_repo: str) -> bool:
+    """True if ``source_code_repo`` names this scanning tool's own repo.
+
+    This script scans customer/target repos on a caller's behalf — it must
+    never scan (and upload results for) itself. A self-scan that reaches
+    the shared production SCM backend creates a real, customer-visible
+    "aipo-mcp-server" project entry with no business being there (this
+    happened in production). Dev testing against a copy of this tool's own
+    code must use a differently-named fork/local path, not this repo's
+    real identity.
+    """
+    repo = (source_code_repo or "").strip().rstrip("/")
+    if not repo:
+        return False
+    if repo.lower().endswith(".git"):
+        repo = repo[: -len(".git")]
+    slug = repo.rsplit("/", 1)[-1].strip().lower().replace("_", "-")
+    return slug in _SELF_SCAN_REPO_SLUGS
+
+
+def _execute_scan(args: argparse.Namespace) -> int:
+    repo = args.repo or os.environ.get("GITHUB_REPOSITORY", "")
+    branch = args.branch or os.environ.get("GITHUB_REF_NAME", "")
+    head_sha = args.head_sha or os.environ.get("GITHUB_SHA", "")
+    source_path = os.path.abspath(args.source_path)
+    server_url = args.mcp_server_url or os.environ.get("MCP_SERVER_URL", "") or MCP_SERVER_URL
+    source_code_repo = f"https://github.com/{repo}.git" if repo else source_path
+
+    if _is_self_scan_target(source_code_repo) or _is_self_scan_target(repo):
+        logger.error(
+            "Refusing to scan %s: this is aipo_mcp_server's own repo. This "
+            "tool scans customer/target repos on a caller's behalf and must "
+            "never scan (and upload results for) itself.",
+            source_code_repo,
+        )
+        output = build_json_output(
+            status="error", repo=repo, branch=branch, head_sha=head_sha,
+            source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
+            violations=[],
+            scan_errors=[
+                f"Refusing to scan {source_code_repo!r}: this is aipo_mcp_server's "
+                "own repo, which must never be scanned by this tool."
+            ],
+        )
+        print_human_output(output)
+        return 2
+
+    # Validate config
+    missing = [n for n, v in [("GITHUB_REPOSITORY / --repo", repo), ("GITHUB_REF_NAME / --branch", branch)] if not v]
+    if missing:
+        output = build_json_output(
+            status="error", repo=repo, branch=branch, head_sha=head_sha,
+            source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
+            violations=[], scan_errors=[f"Missing required config: {', '.join(missing)}"],
+        )
+        print_human_output(output)
+        return 2
+
+    github_token = (
+        (getattr(args, "github_token", None) or "").strip()
+        or os.environ.get("GH_TOKEN", "")
+        or os.environ.get("GITHUB_TOKEN", "")
+    )
+    if getattr(args, "create_fix_pr", False) and not github_token:
+        logger.error(
+            "--create-fix-pr was set but --github-token / $GH_TOKEN / $GITHUB_TOKEN is empty. "
+            "Export a token before scanning so a PR can be opened after stubs are applied."
+        )
+        output = build_json_output(
+            status="error", repo=repo, branch=branch, head_sha=head_sha,
+            source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
+            violations=[],
+            scan_errors=[
+                "--create-fix-pr requires --github-token or $GH_TOKEN / $GITHUB_TOKEN "
+                "(got empty). Export the token and re-run."
+            ],
+        )
+        print_human_output(output)
+        return 2
+
+    try:
+        bearer_getter = build_bearer_getter(_scan_refresh_token(args))
+        # Eagerly exchange the refresh token so a bad/expired token fails
+        # here instead of after a full scan. Do not PAT-introspect it.
+        access_token = bearer_getter()
+        jwt_tenant_id = _tenant_id_from_access_jwt(access_token)
+        if jwt_tenant_id:
+            os.environ.setdefault("GR_TENANT_ID", jwt_tenant_id)
+            os.environ.setdefault("LINEAJE_TENANT_ID", jwt_tenant_id)
+            logger.info("Auth OK — tenant_id=%s from access JWT (no PAT introspect)", jwt_tenant_id)
+        else:
+            jwt_tenant_id = os.environ.get("GR_TENANT_ID") or os.environ.get("LINEAJE_TENANT_ID") or ""
+            logger.info("Auth OK — renew-access-token exchange succeeded (token len=%d)", len(access_token))
+    except Exception as exc:
+        output = build_json_output(
+            status="error", repo=repo, branch=branch, head_sha=head_sha,
+            source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
+            violations=[], scan_errors=[f"Auth failed: {exc}"],
+        )
+        print_human_output(output)
+        return 2
+
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    scan_start = time.perf_counter()
+
+    logger.info("Scanning source path: %s (repo=%s branch=%s sha=%s)", source_path, repo, branch, head_sha[:7] if head_sha else "?")
+
+    # Step 1: Collect files
+    file_list = collect_repo_files(source_path)
+    if not file_list:
+        logger.info("No scannable files found")
+        output = build_json_output(
+            status="compliant", repo=repo, branch=branch, head_sha=head_sha,
+            source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
+            violations=[],
+        )
+        print_human_output(output)
         return 0
+
+    manifest_files = [f for f in file_list if _is_manifest_file(os.path.basename(f))]
+    code_files = [f for f in file_list if not _is_manifest_file(os.path.basename(f))]
+    scan_files = code_files if code_files else file_list
+    batch_size = _batch_size(len(scan_files))
+    batches = [scan_files[i: i + batch_size] for i in range(0, len(scan_files), batch_size)]
+    logger.info(
+        "Files: %d total (%d code, %d manifest) → %d batch(es) of ≤%d",
+        len(file_list), len(code_files), len(manifest_files), len(batches), batch_size,
+    )
+
+    # Step 2: MCP scan
+    with tempfile.TemporaryDirectory(prefix="gha-repo-scan-") as temp_dir:
+        (
+            all_violations, all_reports, all_aibom, failed_batches_count,
+            failure_details, enforce_service_url, all_stub_insertions,
+        ) = parallel_batch_scan(
+            batches=batches,
+            source_dir=source_path,
+            temp_dir=temp_dir,
+            source_code_repo=source_code_repo,
+            branch=branch,
+            head_sha=head_sha,
+            run_id=run_id,
+            server_url=server_url,
+            bearer_getter=bearer_getter,
+            manifest_files=manifest_files or None,
+        )
+
+    elapsed = time.perf_counter() - scan_start
+    logger.info(
+        "Scan complete in %.1fs: %d violation(s), %d AIBOM entry/ies, %d failed batch(es)",
+        elapsed, len(all_violations), len(all_aibom), failed_batches_count,
+    )
+
+    combined_report = _combine_scan_reports(all_reports)
+
+    if failed_batches_count and not all_violations:
+        output = build_json_output(
+            status="error", repo=repo, branch=branch, head_sha=head_sha,
+            source_code_repo=source_code_repo, files_scanned=len(file_list),
+            batches=len(batches), failed_batches=failed_batches_count,
+            violations=[], aibom=all_aibom, report=combined_report,
+            scan_errors=failure_details, enforce_service_url=enforce_service_url,
+        )
+        print_human_output(output)
+        return 1
+
+    status = "compliant" if not all_violations else "violations_found"
+    if failed_batches_count:
+        status = "error"
+
+    # Step 3: Insert guardrail stubs and create PR.
+    # Prefer MCP stub_insertions / patched_files. If --create-fix-pr is set
+    # but the server returned nothing applyable, insert locally from
+    # violations so a PR still opens. Do NOT apply remediation_actions.
+    remediation_pr_number: Optional[int] = None
+    remediation_branch = ""
+    failed_rem_files: List[str] = []
+
+    github_token = (
+        (getattr(args, "github_token", None) or "").strip()
+        or os.environ.get("GH_TOKEN", "")
+        or os.environ.get("GITHUB_TOKEN", "")
+    )
+    should_create_pr = bool(github_token and getattr(args, "create_fix_pr", False))
+    validated_fixes: Dict[str, str] = {}
+    fix_table: List[Dict[str, str]] = []
+
+    if all_stub_insertions:
+        logger.info(
+            "STEP 3: Applying %d MCP stub insertion(s)",
+            len(all_stub_insertions),
+        )
+        validated_fixes, failed_rem_files = apply_stub_insertions_to_clone(
+            all_stub_insertions, source_path,
+        )
+        fix_table = [
+            {
+                "policy": ", ".join(
+                    {pd.get("policy_id", "") for pd in (s.get("policy_details") or []) if pd.get("policy_id")}
+                ) or "guardrail_stub",
+                "description": s.get("description", "")[:200],
+                "file": s.get("file", ""),
+            }
+            for s in all_stub_insertions
+            if s.get("status") == "detected" and (s.get("file") or "") in validated_fixes
+        ]
+
+    if should_create_pr and not validated_fixes and all_violations:
+        logger.info(
+            "MCP returned 0 applyable stubs — attempting local insertion-point scan "
+            "(%d violation(s))",
+            len(all_violations),
+        )
+        local_fixes, local_failed, local_table, local_err = try_local_stub_insertions_from_checkout(
+            source_path,
+            file_list,
+            all_violations,
+            lineaje_pat=_scan_refresh_token(args),
+        )
+        if local_err:
+            logger.warning("%s", local_err)
+        validated_fixes = local_fixes
+        failed_rem_files.extend(local_failed)
+        fix_table = local_table
+        if validated_fixes:
+            logger.info("Local stub insertion produced %d file(s) to commit", len(validated_fixes))
+
+    if validated_fixes:
+        _ensure_refresh_token_in_validated_fixes(
+            validated_fixes, _scan_refresh_token(args), source_path,
+        )
+
+    if should_create_pr and validated_fixes:
+        logger.info("Creating stub PR (%d file(s))", len(validated_fixes))
+        try:
+            remediation_pr_number, remediation_branch, pr_error = _create_fix_pr(
+                github_token, repo, branch, head_sha,
+                validated_fixes, fix_table,
+                report=combined_report, failed_files=failed_rem_files,
+                violations=all_violations,
+            )
+            if pr_error:
+                logger.error("%s", pr_error)
+        except Exception as exc:
+            logger.error("Stub insertion / PR step failed: %s", exc)
+    elif should_create_pr:
+        logger.warning(
+            "Skipping stub PR — --create-fix-pr was set but there were no stub files "
+            "to commit (mcp stub_insertions=%d violations=%d)",
+            len(all_stub_insertions), len(all_violations),
+        )
+    elif all_stub_insertions and not getattr(args, "create_fix_pr", False):
+        logger.info("Skipping stub PR — pass --create-fix-pr to insert stubs and open a PR")
+    elif all_stub_insertions:
+        logger.info("Skipping stub PR — GITHUB_TOKEN / --github-token not set")
+
+    output = build_json_output(
+        status=status, repo=repo, branch=branch, head_sha=head_sha,
+        source_code_repo=source_code_repo, files_scanned=len(file_list),
+        batches=len(batches), failed_batches=failed_batches_count,
+        violations=all_violations, aibom=all_aibom, report=combined_report,
+        remediation_pr=remediation_pr_number,
+        remediation_branch=remediation_branch,
+        failed_remediation_files=failed_rem_files,
+        scan_errors=failure_details,
+        enforce_service_url=enforce_service_url,
+    )
+    print_human_output(output)
+    return 0
+
+# ===========================================================================
+# CLI
+# ===========================================================================
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Lineaje AI Policy Scanner — GitHub Actions edition",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--source-path", default=".",
+        help="Path to the checked-out source code (default: current directory)",
+    )
+    parser.add_argument(
+        "--repo", default="",
+        help="Repository owner/repo slug (default: $GITHUB_REPOSITORY)",
+    )
+    parser.add_argument(
+        "--branch", default="",
+        help="Branch name (default: $GITHUB_REF_NAME)",
+    )
+    parser.add_argument(
+        "--head-sha", default="",
+        help="Commit SHA (default: $GITHUB_SHA)",
+    )
+    parser.add_argument(
+        "--mcp-server-url", default="",
+        help=f"MCP server URL (default: {MCP_SERVER_URL})",
+    )
+    parser.add_argument(
+        "--github-token", default="",
+        help="GitHub token for creating remediation PRs (default: $GH_TOKEN then $GITHUB_TOKEN). "
+             "If not set, violations are reported but no PR is created.",
+    )
+    parser.add_argument(
+        "--lineaje-pat", default="", dest="lineaje_pat",
+        help="Lineaje PAT / refresh token for MCP auth (default: $LINEAJE_PAT_TOKEN). "
+             "Inserted guardrail stubs read their own auth from GR_BEARER_TOKEN / "
+             "LINEAJE_PAT_TOKEN / LINEAJE_PAT at the customer's own runtime — this "
+             "flag only authenticates THIS scan's MCP calls.",
+    )
+    parser.add_argument(
+        "--refresh-token", default="", dest="refresh_token",
+        help="Alias for --lineaje-pat.",
+    )
+    parser.add_argument(
+        "--create-fix-pr", default=False, action="store_true",
+        help="Create a PR that inserts guardrail stubs and enforce-API config "
+             "into the customer codebase (default: false). Does not apply "
+             "remediation_actions / fix_code comments.",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable DEBUG logging to stderr",
+    )
+    return parser.parse_args(argv or sys.argv[1:])
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.WARNING,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stderr,
+    )
+    # Always show INFO from this logger regardless of --debug
+    logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
+
+    try:
+        return _execute_scan(args)
+    except Exception:
+        logger.exception("Unhandled error")
+        err = {"status": "error", "scan_errors": ["Unhandled exception — see stderr logs"]}
+        print_human_output(err)
+        return 1
 
 
 if __name__ == "__main__":
