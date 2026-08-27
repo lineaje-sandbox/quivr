@@ -5,9 +5,10 @@ This file is the **standalone** script the GitHub Action copies into the
 runner (``.lineaje-scanner/scripts/gha_repo_scan.py``). The rest of
 ``aipo_mcp_server`` is not present there — do not import ``scm_client``,
 ``config``, ``mcp_server``, ``adapter``, ``pipeline``, ``gha_stub_insertion``,
-or anything else from this repo. Stdlib only (plus the ``mcp`` client
-package). If ``insertion_point_scanner.py`` happens to sit next to this
-file, a local stub fallback may run; otherwise it is skipped silently.
+``insertion_point_scanner``, or anything else from this repo. Stdlib only
+(plus the ``mcp`` client package). Stub insertions come from the MCP
+response and are applied with stdlib; skipped/failed stub rows are never
+logged or added to the report.
 
 Scans already-checked-out source code against Lineaje AI security policies
 and prints results as structured JSON to stdout. Designed to run on a
@@ -1063,14 +1064,13 @@ def _stub_insertions_from_mcp_result(mcp_result: Dict[str, Any]) -> List[Dict[st
 def apply_stub_insertions_to_clone(
     stub_insertions: List[Dict[str, Any]],
     source_dir: str,
-) -> Tuple[Dict[str, str], List[str]]:
-    """Apply the server-computed stub_insertions to files under source_dir.
+) -> Dict[str, str]:
+    """Apply server-computed stub_insertions. Returns repo-relative path → content.
 
-    Returns ``(validated_fixes, failed_or_skipped)`` — validated_fixes maps
-    repo-relative path -> new file content, ready for _create_fix_pr.
+    Unsafe / missing / invalid hits are dropped silently — they are not logged
+    and are not returned as skipped/failed rows.
     """
     by_file: Dict[str, List[Dict[str, Any]]] = {}
-    skipped: List[str] = []
     validated: Dict[str, str] = {}
     for s in stub_insertions:
         rel = (s.get("file") or "").strip().replace("\\", "/")
@@ -1084,14 +1084,12 @@ def apply_stub_insertions_to_clone(
             validated[rel] = s["new_content"]
             continue
         if not s.get("safe_to_insert"):
-            skipped.append(f"{rel}:{s.get('line', '')} {s.get('skip_reason', '') or 'unsafe'}".strip())
             continue
         by_file.setdefault(rel, []).append(s)
 
     for rel_path, hits in by_file.items():
         abs_path = os.path.join(source_dir, rel_path)
         if not os.path.isfile(abs_path):
-            skipped.append(f"{rel_path} not found in checkout")
             continue
 
         with open(abs_path, encoding="utf-8", errors="replace") as fh:
@@ -1127,13 +1125,13 @@ def apply_stub_insertions_to_clone(
         if ext == ".py":
             syntax_err = validate_python_source(new_content, abs_path)
             if syntax_err:
-                skipped.append(f"{rel_path} would be invalid Python after insertion ({syntax_err})")
                 continue
 
         validated[rel_path] = new_content
 
-    logger.info("Stub insertions applied: %d file(s) changed", len(validated))
-    return validated, skipped
+    if validated:
+        logger.info("Applied guardrail stubs in %d file(s)", len(validated))
+    return validated
 
 
 _GUARDRAIL_MANIFEST_REL = ".lineaje/guardrail.json"
