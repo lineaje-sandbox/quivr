@@ -1783,6 +1783,33 @@ def apply_pipeline_fix_code_to_clone(
 # Remediation PR creation
 # ===========================================================================
 
+def _normalize_github_repo_slug(repo: str) -> str:
+    """``owner/name`` only — strip whitespace so GitHub URLs stay valid.
+
+    GHA ``GITHUB_REPOSITORY`` / ``--repo`` sometimes has trailing spaces
+    (``lineaje-sandbox/quivr  ``) which urllib rejects as control characters.
+    """
+    s = (repo or "").strip()
+    s = re.sub(r"[\x00-\x1f\x7f]+", "", s)
+    s = re.sub(r"\s+", "", s)
+    s = s.strip("/")
+    if s.lower().endswith(".git"):
+        s = s[:-4]
+    lower = s.lower()
+    marker = "github.com/"
+    idx = lower.find(marker)
+    if idx != -1:
+        s = s[idx + len(marker):]
+    s = s.strip("/")
+    parts = [p for p in s.split("/") if p]
+    if len(parts) >= 2:
+        return f"{parts[-2]}/{parts[-1]}"
+    return s
+
+
+def _normalize_git_ref(value: str) -> str:
+    return re.sub(r"[\s\x00-\x1f\x7f]+", "", (value or "").strip())
+
 class _GhaGitHubClient:
     """Minimal GitHub REST client for the standalone GHA scanner.
 
@@ -1829,12 +1856,14 @@ class _GhaGitHubClient:
             raise
 
     def create_branch(self, repo: str, branch_name: str, from_sha: str) -> None:
+        repo = _normalize_github_repo_slug(repo)
         self._request("POST", f"/repos/{repo}/git/refs", {
             "ref": f"refs/heads/{branch_name}",
             "sha": from_sha,
         })
 
     def get_file_blob_sha(self, repo: str, path: str, ref: str) -> Optional[str]:
+        repo = _normalize_github_repo_slug(repo)
         encoded_path = urllib.parse.quote(path, safe="/")
         qref = urllib.parse.quote(ref, safe="")
         try:
@@ -1860,6 +1889,7 @@ class _GhaGitHubClient:
         message: str,
         sha: Optional[str] = None,
     ) -> str:
+        repo = _normalize_github_repo_slug(repo)
         if sha is None:
             sha = self.get_file_blob_sha(repo, path, branch)
         payload: Dict[str, Any] = {
@@ -1882,6 +1912,7 @@ class _GhaGitHubClient:
         body: str,
         **_kw: Any,
     ) -> int:
+        repo = _normalize_github_repo_slug(repo)
         resp = self._request("POST", f"/repos/{repo}/pulls", {
             "title": title,
             "head": head,
@@ -1909,7 +1940,11 @@ def _create_fix_pr(
     if not validated_fixes:
         return None, "", ""
 
-    if not head_sha:
+    repo = _normalize_github_repo_slug(repo)
+    branch = _normalize_git_ref(branch)
+    head_sha = _normalize_git_ref(head_sha)
+
+    if not repo:
         logger.error(
             "Cannot create remediation branch: head_sha is empty. "
             "Pass --head-sha or ensure $GITHUB_SHA is set in the environment."
@@ -2025,9 +2060,11 @@ def _is_self_scan_target(source_code_repo: str) -> bool:
 
 
 def _execute_scan(args: argparse.Namespace) -> int:
-    repo = args.repo or os.environ.get("GITHUB_REPOSITORY", "")
-    branch = args.branch or os.environ.get("GITHUB_REF_NAME", "")
-    head_sha = args.head_sha or os.environ.get("GITHUB_SHA", "")
+    repo = _normalize_github_repo_slug(
+        args.repo or os.environ.get("GITHUB_REPOSITORY", "")
+    )
+    branch = _normalize_git_ref(args.branch or os.environ.get("GITHUB_REF_NAME", ""))
+    head_sha = _normalize_git_ref(args.head_sha or os.environ.get("GITHUB_SHA", ""))
     source_path = os.path.abspath(args.source_path)
     server_url = args.mcp_server_url or os.environ.get("MCP_SERVER_URL", "") or MCP_SERVER_URL
     source_code_repo = f"https://github.com/{repo}.git" if repo else source_path
