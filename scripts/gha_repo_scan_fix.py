@@ -1205,181 +1205,6 @@ def _ensure_refresh_token_in_validated_fixes(
     logger.info("Customer %s refreshtoken=set (SCIM refresh token)", rel)
 
 
-# Extensions insertion_point_scanner.scan_file() actually scans. Passing the
-# full GHA file_list (lockfiles, markdown, images) is a no-op per file but
-# wastes runner time; restrict to these.
-_LOCAL_STUB_SCANNABLE_EXTS = frozenset({".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go"})
-_LOCAL_STUB_SKIP_BASENAMES = frozenset({
-    "gr_stub_client.py",
-    "gha_repo_scan.py",
-    "gha_repo_scan_fix.py",
-    "gha_stub_insertion.py",
-    "lineaje_ai_scan.py",
-    "insertion_point_scanner.py",
-    "scan_common.py",
-})
-_LOCAL_STUB_MAX_FILES = 200
-
-
-def _sibling_insertion_point_scanner_path() -> str:
-    """Path of a co-deployed scanner sitting next to this script, if any."""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "insertion_point_scanner.py")
-
-
-def _ensure_insertion_point_scanner_on_path() -> bool:
-    """Return True only when ``insertion_point_scanner.py`` is next to this file.
-
-    Never adds the aipo_mcp_server repo root (or any other parent) to
-    ``sys.path`` — this script must stay standalone on a GHA runner that
-    ships only ``gha_repo_scan.py``.
-    """
-    scanner = _sibling_insertion_point_scanner_path()
-    if not os.path.isfile(scanner):
-        return False
-    here = os.path.dirname(scanner)
-    if here not in sys.path:
-        sys.path.insert(0, here)
-    return True
-
-
-def _rel_candidate_file(file_path: str, source_dir: str) -> str:
-    path = (file_path or "").strip().replace("\\", "/")
-    if not path:
-        return ""
-    src = os.path.realpath(source_dir)
-    abs_path = path if os.path.isabs(path) else os.path.normpath(os.path.join(src, path))
-    try:
-        rel = os.path.relpath(os.path.realpath(abs_path), src)
-    except ValueError:
-        return os.path.basename(path).replace("\\", "/")
-    if rel.startswith(".."):
-        return os.path.basename(path).replace("\\", "/")
-    return rel.replace("\\", "/")
-
-
-def _scannable_files_for_local_stubs(
-    violations: List[Dict[str, Any]],
-    file_list: List[str],
-    source_dir: str,
-) -> List[str]:
-    """Prefer files named in violations; otherwise every scannable path in file_list."""
-    listed = {(f or "").replace("\\", "/") for f in file_list}
-    from_violations: List[str] = []
-    seen: set = set()
-    for v in violations or []:
-        rel = _rel_candidate_file(v.get("file") or "", source_dir)
-        if (
-            rel
-            and rel in listed
-            and pathlib.Path(rel).suffix.lower() in _LOCAL_STUB_SCANNABLE_EXTS
-            and pathlib.Path(rel).name.lower() not in _LOCAL_STUB_SKIP_BASENAMES
-            and rel not in seen
-        ):
-            seen.add(rel)
-            from_violations.append(rel)
-    if from_violations:
-        return from_violations
-    return [
-        f.replace("\\", "/")
-        for f in file_list
-        if pathlib.Path(f).suffix.lower() in _LOCAL_STUB_SCANNABLE_EXTS
-        and pathlib.Path(f).name.lower() not in _LOCAL_STUB_SKIP_BASENAMES
-    ]
-
-
-def local_stub_insertions_from_checkout(
-    source_dir: str,
-    file_list: List[str],
-    violations: List[Dict[str, Any]],
-    *,
-    lineaje_pat: str = "",
-) -> Tuple[Dict[str, str], List[str], List[Dict[str, str]]]:
-    """Scan the GHA checkout with insertion_point_scanner and apply stubs.
-
-    Replaces the old ``gha_stub_insertion`` import, which required this
-    repo's full ``pipeline/stub`` package — never present on a customer
-    runner. Returns the same ``(validated_fixes, failed, fix_table)`` shape
-    ``_execute_scan`` uses for the MCP-provided stub_insertions path.
-    """
-    if not _ensure_insertion_point_scanner_on_path():
-        raise ModuleNotFoundError(
-            "insertion_point_scanner.py is not co-deployed next to this script"
-        )
-    from insertion_point_scanner import scan_project as _scan_project_local
-    from insertion_point_scanner import _import_hint as _local_import_hint
-
-    targets = _scannable_files_for_local_stubs(violations, file_list, source_dir)
-    if not targets:
-        logger.info("Local insertion-point scan: no scannable files in checkout")
-        return {}, [], []
-    if len(targets) > _LOCAL_STUB_MAX_FILES:
-        logger.warning(
-            "Local insertion-point scan: capping %d scannable file(s) to %d",
-            len(targets), _LOCAL_STUB_MAX_FILES,
-        )
-        targets = targets[:_LOCAL_STUB_MAX_FILES]
-
-    candidates, _mw = _scan_project_local(
-        project_root=source_dir,
-        files_to_scan=targets,
-        lineaje_pat=lineaje_pat or "",
-        max_files=max(len(targets), 1),
-    )
-    stub_insertions: List[Dict[str, Any]] = []
-    for c in candidates:
-        rel = _rel_candidate_file(c.file, source_dir)
-        stub_insertions.append({
-            "file": rel,
-            "line": c.line,
-            "status": "detected",
-            "proposed_stub": c.proposed_stub,
-            "insert_after": c.insert_after,
-            "safe_to_insert": c.safe_to_insert,
-            "skip_reason": c.skip_reason,
-            "description": c.description,
-            "import_needed": _local_import_hint(os.path.splitext(rel)[1]),
-        })
-    validated, failed = apply_stub_insertions_to_clone(stub_insertions, source_dir)
-    fix_table = [
-        {
-            "policy": "guardrail_stub",
-            "description": (s.get("description") or "")[:200],
-            "file": s.get("file", ""),
-        }
-        for s in stub_insertions
-        if s.get("status") == "detected" and (s.get("file") or "") in validated
-    ]
-    logger.info(
-        "Local insertion-point scan: %d candidate(s) found, %d file(s) applied",
-        len(candidates), len(validated),
-    )
-    return validated, failed, fix_table
-
-
-def try_local_stub_insertions_from_checkout(
-    source_dir: str,
-    file_list: List[str],
-    violations: List[Dict[str, Any]],
-    *,
-    lineaje_pat: str = "",
-) -> Tuple[Dict[str, str], List[str], List[Dict[str, str]], Optional[str]]:
-    """Fail-open wrapper: a missing scanner is a silent skip, not a scan error."""
-    if not _ensure_insertion_point_scanner_on_path():
-        logger.info(
-            "Skipping local stub fallback — insertion_point_scanner.py is not "
-            "next to this script (standalone GHA deploy)"
-        )
-        return {}, [], [], None
-    try:
-        validated, failed, table = local_stub_insertions_from_checkout(
-            source_dir, file_list, violations, lineaje_pat=lineaje_pat,
-        )
-        return validated, failed, table, None
-    except Exception as exc:
-        logger.warning("Local stub insertion failed: %s", exc)
-        return {}, [], [], None
-
-
 # ===========================================================================
 # Parallel batch scan
 # ===========================================================================
@@ -1512,7 +1337,7 @@ _STUB_REPORT_HEADINGS = (
 
 
 def _strip_stub_insertion_markdown(report: str) -> str:
-    """Drop stub-insertion sections from the policy report markdown."""
+    """Drop stub-insertion / skipped-stub write-ups from the policy report."""
     if not report:
         return ""
     parts = re.split(r"(?=^## )", report, flags=re.MULTILINE)
@@ -1522,6 +1347,13 @@ def _strip_stub_insertion_markdown(report: str) -> str:
             continue
         kept.append(part)
     text = "".join(kept)
+    text = re.sub(r"<details>[\s\S]*?Sites skipped[\s\S]*?</details>", "", text, flags=re.I)
+    text = re.sub(
+        r"^.*\b(stub insertion (skipped|failed)|sites skipped|skip_reason)\b.*$\n?",
+        "",
+        text,
+        flags=re.I | re.M,
+    )
     text = re.sub(r"\n---\s*(?=\n*$)", "\n", text)
     text = re.sub(r"\n---\s*\n+(?=\n## |\n### |\Z)", "\n\n", text)
     return text.strip() + ("\n" if text.strip() else "")
@@ -1542,7 +1374,6 @@ def build_json_output(
     report: str = "",
     remediation_pr: Optional[int] = None,
     remediation_branch: str = "",
-    failed_remediation_files: Optional[List[str]] = None,
     scan_errors: Optional[List[str]] = None,
     enforce_service_url: str = "",
 ) -> Dict[str, Any]:
@@ -1564,7 +1395,6 @@ def build_json_output(
         "enforce_service_url": enforce_service_url,
         "remediation_pr": remediation_pr,
         "remediation_branch": remediation_branch,
-        "failed_remediation_files": failed_remediation_files or [],
         "scan_errors": scan_errors or [],
     }
 
@@ -2070,7 +1900,6 @@ def _create_fix_pr(
     fix_table: List[Dict[str, str]],
     *,
     report: str = "",
-    failed_files: Optional[List[str]] = None,
     violations: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Optional[int], str, str]:
     """Commit stub + enforce-API files to a branch and open a PR.
@@ -2345,13 +2174,10 @@ def _execute_scan(args: argparse.Namespace) -> int:
     if failed_batches_count:
         status = "error"
 
-    # Step 3: Insert guardrail stubs and create PR.
-    # Prefer MCP stub_insertions / patched_files. If --create-fix-pr is set
-    # but the server returned nothing applyable, insert locally from
-    # violations so a PR still opens. Do NOT apply remediation_actions.
+    # Step 3: Apply MCP stub_insertions / patched_files and open a PR.
+    # Do NOT apply remediation_actions. This script is standalone.
     remediation_pr_number: Optional[int] = None
     remediation_branch = ""
-    failed_rem_files: List[str] = []
 
     github_token = (
         (getattr(args, "github_token", None) or "").strip()
@@ -2363,11 +2189,8 @@ def _execute_scan(args: argparse.Namespace) -> int:
     fix_table: List[Dict[str, str]] = []
 
     if all_stub_insertions:
-        logger.info(
-            "STEP 3: Applying %d MCP stub insertion(s)",
-            len(all_stub_insertions),
-        )
-        validated_fixes, failed_rem_files = apply_stub_insertions_to_clone(
+        logger.info("STEP 3: Applying %d MCP stub(s)", len(all_stub_insertions))
+        validated_fixes = apply_stub_insertions_to_clone(
             all_stub_insertions, source_path,
         )
         fix_table = [
@@ -2382,54 +2205,26 @@ def _execute_scan(args: argparse.Namespace) -> int:
             if s.get("status") == "detected" and (s.get("file") or "") in validated_fixes
         ]
 
-    if should_create_pr and not validated_fixes and all_violations:
-        logger.info(
-            "MCP returned 0 applyable stubs — attempting local insertion-point scan "
-            "(%d violation(s))",
-            len(all_violations),
-        )
-        local_fixes, local_failed, local_table, local_err = try_local_stub_insertions_from_checkout(
-            source_path,
-            file_list,
-            all_violations,
-            lineaje_pat=_scan_refresh_token(args),
-        )
-        if local_err:
-            logger.warning("%s", local_err)
-        validated_fixes = local_fixes
-        failed_rem_files.extend(local_failed)
-        fix_table = local_table
-        if validated_fixes:
-            logger.info("Local stub insertion produced %d file(s) to commit", len(validated_fixes))
-
-    if validated_fixes:
+    if should_create_pr or validated_fixes:
         _ensure_refresh_token_in_validated_fixes(
             validated_fixes, _scan_refresh_token(args), source_path,
         )
 
     if should_create_pr and validated_fixes:
-        logger.info("Creating stub PR (%d file(s))", len(validated_fixes))
+        logger.info("Creating remediation PR (%d file(s))", len(validated_fixes))
         try:
             remediation_pr_number, remediation_branch, pr_error = _create_fix_pr(
                 github_token, repo, branch, head_sha,
                 validated_fixes, fix_table,
-                report=combined_report, failed_files=failed_rem_files,
+                report=combined_report,
                 violations=all_violations,
             )
             if pr_error:
                 logger.error("%s", pr_error)
         except Exception as exc:
-            logger.error("Stub insertion / PR step failed: %s", exc)
+            logger.error("Remediation PR failed: %s", exc)
     elif should_create_pr:
-        logger.warning(
-            "Skipping stub PR — --create-fix-pr was set but there were no stub files "
-            "to commit (mcp stub_insertions=%d violations=%d)",
-            len(all_stub_insertions), len(all_violations),
-        )
-    elif all_stub_insertions and not getattr(args, "create_fix_pr", False):
-        logger.info("Skipping stub PR — pass --create-fix-pr to insert stubs and open a PR")
-    elif all_stub_insertions:
-        logger.info("Skipping stub PR — GITHUB_TOKEN / --github-token not set")
+        logger.info("No files to commit for a remediation PR")
 
     output = build_json_output(
         status=status, repo=repo, branch=branch, head_sha=head_sha,
@@ -2438,7 +2233,6 @@ def _execute_scan(args: argparse.Namespace) -> int:
         violations=all_violations, aibom=all_aibom, report=combined_report,
         remediation_pr=remediation_pr_number,
         remediation_branch=remediation_branch,
-        failed_remediation_files=failed_rem_files,
         scan_errors=failure_details,
         enforce_service_url=enforce_service_url,
     )
